@@ -1,4 +1,5 @@
 const cloud = require("wx-server-sdk");
+const Collections = require("../shared/collections");
 const paymentGateway = require("../shared/paymentGateway.js");
 
 cloud.init({
@@ -8,10 +9,10 @@ cloud.init({
 const db = cloud.database();
 const _ = db.command;
 
-const CHALLENGE_SESSION_COLLECTION = "challenge_sessions";
-const ORDER_COLLECTION = "order";
-const REFUNDS_COLLECTION = "refunds";
-const REFUND_TASKS_COLLECTION = "refund_tasks";
+const CHALLENGE_SESSION_COLLECTION = Collections.CHALLENGE_SESSION;
+const ORDER_COLLECTION = Collections.ORDER;
+const REFUNDS_COLLECTION = Collections.REFUNDS;
+const REFUND_TASKS_COLLECTION = Collections.REFUND_TASKS;
 
 const SETTLING_TIMEOUT_MS = 60 * 1000; // 60秒超时卡死判定
 const PROCESSING_TIMEOUT_MS = 120 * 1000; // 120秒退款处理超时主动查单

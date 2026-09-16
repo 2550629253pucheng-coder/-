@@ -58,11 +58,16 @@ async function runWithTransaction(database, fn) {
   }
 }
 
-// 集合定义
-const ORDER_COLLECTION = "order";
-const CHALLENGE_SESSION_COLLECTION = "challenge_session";
-const CHALLENGE_RULES_COLLECTION = "challenge_rules";
-const REFUNDS_COLLECTION = "refunds";
+// 集合定义 (严格统一引用共享常量)
+const Collections = require("../shared/collections");
+const ORDER_COLLECTION = Collections.ORDER;
+const CHALLENGE_SESSION_COLLECTION = Collections.CHALLENGE_SESSION;
+const CHALLENGE_RULES_COLLECTION = Collections.CHALLENGE_RULES;
+const REFUNDS_COLLECTION = Collections.REFUNDS;
+const REFUND_TASKS_COLLECTION = Collections.REFUND_TASKS;
+const RISK_LOGS_COLLECTION = Collections.RISK_LOGS;
+const COMPLIANCE_EVENTS_COLLECTION = Collections.COMPLIANCE_EVENTS;
+const ACTIVITIES_COLLECTION = Collections.ACTIVITIES;
 
 // 活动模式: TEST (测试模式) | LIVE (正式模式)
 const ACTIVITY_MODE = process.env.ACTIVITY_MODE || "TEST";
@@ -142,7 +147,16 @@ async function handleGetChallengeContext(openId, { orderId }) {
     .get();
 
   const existingSession = sessionRes.data && sessionRes.data[0];
-  const rule = existingSession ? existingSession.ruleSnapshot : await getEffectiveRule();
+  let rule;
+  if (existingSession && existingSession.ruleSnapshot) {
+    rule = existingSession.ruleSnapshot;
+  } else if (order.challengeRuleSnapshot) {
+    rule = order.challengeRuleSnapshot;
+  } else if (ACTIVITY_MODE === "TEST") {
+    rule = await getEffectiveRule();
+  } else {
+    throw new Error("CHALLENGE_RULE_SNAPSHOT_MISSING");
+  }
 
   return {
     success: true,
@@ -693,7 +707,7 @@ async function handleSubmitChallenge(openId, payload) {
         createdAt: now,
         updatedAt: now,
       };
-      await t.collection("refund_tasks").doc(refundTaskId).set({
+      await t.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).set({
         data: taskDoc,
       });
 
@@ -748,7 +762,7 @@ async function dispatchRefundTask(taskDoc, session, order) {
         },
       });
 
-      await db.collection("refund_tasks").doc(refundTaskId).update({
+      await db.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).update({
         data: {
           status: "SUCCESS",
           updatedAt: now,
@@ -778,7 +792,7 @@ async function dispatchRefundTask(taskDoc, session, order) {
           updatedAt: now,
         },
       });
-      await db.collection("refund_tasks").doc(refundTaskId).update({
+      await db.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).update({
         data: {
           status: "FAILED",
           lastError: "SIMULATED_TEST_FAILURE",
@@ -792,7 +806,7 @@ async function dispatchRefundTask(taskDoc, session, order) {
   }
 
   // LIVE 模式：通过统一 paymentGateway 发起退款
-  await db.collection("refund_tasks").doc(refundTaskId).update({
+  await db.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).update({
     data: {
       status: "PROCESSING",
       updatedAt: now,
@@ -819,7 +833,7 @@ async function dispatchRefundTask(taskDoc, session, order) {
           updatedAt: now,
         },
       });
-      await db.collection("refund_tasks").doc(refundTaskId).update({
+      await db.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).update({
         data: {
           status: "SUCCESS",
           wechatRefundId: refundRes.refundId || null,
@@ -850,7 +864,7 @@ async function dispatchRefundTask(taskDoc, session, order) {
     const maxRetries = taskDoc.maxRetries || 5;
     const nextStatus = retryCount >= maxRetries ? "DEAD_LETTER" : "RETRY";
 
-    await db.collection("refund_tasks").doc(refundTaskId).update({
+    await db.collection(REFUND_TASKS_COLLECTION).doc(refundTaskId).update({
       data: {
         status: nextStatus,
         retryCount,
@@ -1234,3 +1248,17 @@ exports.main = async (event, context) => {
     return { success: false, message: err.message || "Internal server error" };
   }
 };
+
+// 导出给外部测试 Harness 和业务层使用
+exports.handleGetChallengeContext = handleGetChallengeContext;
+exports.handleStartSession = handleStartSession;
+exports.handleSubmitChallenge = handleSubmitChallenge;
+exports.handleResumeSession = handleResumeSession;
+exports.handleSkipChallenge = handleSkipChallenge;
+exports.handleRecoverSettlingSession = handleRecoverSettlingSession;
+exports.handleGetSession = handleGetSession;
+exports.createSignedTicket = createSignedTicket;
+exports.verifyTicket = verifyTicket;
+exports.verifyTicketBinding = verifyTicketBinding;
+exports.getEffectiveRule = getEffectiveRule;
+exports.buildDeterministicRefundKeys = buildDeterministicRefundKeys;

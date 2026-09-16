@@ -1,17 +1,27 @@
 /**
  * CloudBase 官方微信支付集成网关 (Payment Gateway)
- * 封装 CloudBase Integration Center 提供的微信支付组件/工作流
- * 业务层禁止直接调用旧版 cloud.cloudPay 或硬编码商户凭证
- * 所有密钥 (APIv3Key, 商户私钥, 证书) 必须由 CloudBase 控制台 Integration Center 托管
+ * 
+ * 核心原则：
+ * 1. 业务层统一调用 createPayment, queryPayment, createRefund, queryRefund，禁止直接使用 wx.cloud / cloud.cloudPay。
+ * 2. 禁止假定写死集成函数名称（如 cloudbase_module 或 pay-common）。
+ *    真实 CloudBase Integration 实际 HTTP/云函数名称由控制台创建时生成，并通过环境变量 PAYMENT_INTEGRATION_FUNCTION_NAME 配置。
+ * 3. 严格区分 TEST 与 LIVE 模式：
+ *    - LIVE 生产模式：若未配置 PAYMENT_INTEGRATION_FUNCTION_NAME，严密 Fail-Closed，拒绝产生不安全支付/退款，抛出明确错误。
+ *    - TEST 模式：允许返回确定性 Mock / 模拟数据供真机测试模式免单挑战流程验证，标记 REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION。
  */
 
-const CLOUDBASE_PAY_MODULE = "cloudbase_module";
-const PAY_COMMON_FUNCTION = "pay-common";
+function isLiveMode() {
+  return process.env.NODE_ENV === "production" || process.env.ACTIVITY_MODE === "LIVE";
+}
+
+function getIntegrationFunctionName() {
+  return process.env.PAYMENT_INTEGRATION_FUNCTION_NAME || null;
+}
 
 /**
- * 创建预支付订单 (统一下单)
+ * 统一下单 (创建预支付订单)
  * @param {Object} cloud - wx-server-sdk 实例
- * @param {Object} params - 下单参数
+ * @param {Object} params - 下单参数 { orderId, totalFee, description, openId, workflowName }
  */
 async function createPayment(cloud, {
   orderId,
@@ -24,10 +34,20 @@ async function createPayment(cloud, {
     throw new Error("createPayment: orderId, totalFee, openId 均为必填字段");
   }
 
-  // 1. 尝试调用 CloudBase Integration Center 托管支付服务
-  try {
+  const fnName = getIntegrationFunctionName();
+
+  // LIVE 模式：必须有真实 CloudBase Integration 配置，严禁隐式降级模拟
+  if (isLiveMode()) {
+    if (!fnName) {
+      const err = new Error(
+        "PAYMENT_INTEGRATION_FUNCTION_NAME_NOT_CONFIGURED: [REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION] 生产环境未配置 CloudBase 微信支付集成函数"
+      );
+      err.code = "PAYMENT_INTEGRATION_FUNCTION_NAME_NOT_CONFIGURED";
+      throw err;
+    }
+
     const res = await cloud.callFunction({
-      name: CLOUDBASE_PAY_MODULE,
+      name: fnName,
       data: {
         name: workflowName,
         action: "wxpay_order",
@@ -48,62 +68,66 @@ async function createPayment(cloud, {
     if (res && res.result) {
       return res.result;
     }
-  } catch (err) {
-    console.warn("[paymentGateway.createPayment] cloudbase_module call failed:", err.message);
+    throw new Error("INVALID_PAYMENT_INTEGRATION_RESPONSE");
+  }
 
-    // 2. 尝试调用 pay-common 官方集成
+  // TEST 模式：若配置了集成函数则调用真实集成，否则安全返回测试模拟凭据
+  if (fnName && cloud && typeof cloud.callFunction === "function") {
     try {
-      const commonRes = await cloud.callFunction({
-        name: PAY_COMMON_FUNCTION,
+      const res = await cloud.callFunction({
+        name: fnName,
         data: {
+          name: workflowName,
           action: "wxpay_order",
-          out_trade_no: orderId,
-          total_fee: totalFee,
-          body: description || "商品订单支付",
-          openid: openId,
+          data: {
+            description: description || "商品订单支付",
+            amount: { total: totalFee, currency: "CNY" },
+            out_trade_no: orderId,
+            payer: { openid: openId },
+          },
         },
       });
-      if (commonRes && commonRes.result) {
-        return commonRes.result;
+      if (res && res.result) {
+        return res.result;
       }
-    } catch (commonErr) {
-      console.warn("[paymentGateway.createPayment] pay-common fallback failed:", commonErr.message);
+    } catch (err) {
+      console.warn("[paymentGateway.createPayment] Integration call warning:", err.message);
     }
-
-    // 3. 外部配置提示：如果在沙箱/测试模式且未配置控制台 Integration，提示清晰状态
-    if (process.env.ACTIVITY_MODE !== "LIVE") {
-      console.log("[paymentGateway.createPayment] TEST_MODE simulated payment pre-order");
-      return {
-        code: 0,
-        sub_code: "TODO_EXTERNAL_CONFIG",
-        message: "TEST_MODE: 请在 CloudBase 控制台 -> 集成中心 (Integration Center) -> 微信支付 完成商户号绑定",
-        paymentData: {
-          timeStamp: String(Math.floor(Date.now() / 1000)),
-          nonceStr: "test_nonce_mock",
-          package: `prepay_id=mock_wx_prepay_${orderId}`,
-          signType: "RSA",
-          paySign: "mock_signature_for_test",
-        },
-      };
-    }
-
-    throw new Error(
-      `TODO_EXTERNAL_CONFIG: 微信支付集成未配置或调用失败: ${err.message}. 请前往 CloudBase 控制台 -> 集成中心 检查微信支付 Integration。`
-    );
   }
+
+  console.log(`[paymentGateway.createPayment] TEST_MODE: simulated prepay order for ${orderId}`);
+  return {
+    code: 0,
+    sub_code: "REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION",
+    message: "TEST_MODE: 未配置或无法连接真实集成云函数，使用沙箱模拟预支付参数",
+    paymentData: {
+      timeStamp: String(Math.floor(Date.now() / 1000)),
+      nonceStr: "test_nonce_mock",
+      package: `prepay_id=mock_wx_prepay_${orderId}`,
+      signType: "RSA",
+      paySign: "mock_signature_for_test",
+    },
+  };
 }
 
 /**
- * 查询支付订单状态 (主动对账/兜底)
+ * 查询支付订单状态 (对账与异常补偿)
  */
 async function queryPayment(cloud, { outTradeNo }) {
   if (!outTradeNo) {
     throw new Error("queryPayment: outTradeNo 必填");
   }
 
-  try {
+  const fnName = getIntegrationFunctionName();
+
+  if (isLiveMode()) {
+    if (!fnName) {
+      throw new Error(
+        "PAYMENT_INTEGRATION_FUNCTION_NAME_NOT_CONFIGURED: [REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION]"
+      );
+    }
     const res = await cloud.callFunction({
-      name: CLOUDBASE_PAY_MODULE,
+      name: fnName,
       data: {
         action: "wxpay_query_order_by_out_trade_no",
         data: {
@@ -112,33 +136,33 @@ async function queryPayment(cloud, { outTradeNo }) {
       },
     });
     if (res && res.result) return res.result;
-  } catch (err) {
-    console.warn("[paymentGateway.queryPayment] query failed:", err.message);
+    throw new Error("QUERY_PAYMENT_FAILED");
   }
 
-  // Fallback to pay-common
-  try {
-    const commonRes = await cloud.callFunction({
-      name: PAY_COMMON_FUNCTION,
-      data: {
-        action: "wxpay_query_order_by_out_trade_no",
-        out_trade_no: outTradeNo,
-      },
-    });
-    if (commonRes && commonRes.result) return commonRes.result;
-  } catch (commonErr) {
-    console.warn("[paymentGateway.queryPayment] pay-common query failed:", commonErr.message);
+  if (fnName && cloud && typeof cloud.callFunction === "function") {
+    try {
+      const res = await cloud.callFunction({
+        name: fnName,
+        data: {
+          action: "wxpay_query_order_by_out_trade_no",
+          data: { out_trade_no: outTradeNo },
+        },
+      });
+      if (res && res.result) return res.result;
+    } catch (err) {
+      console.warn("[paymentGateway.queryPayment] Integration call warning:", err.message);
+    }
   }
 
   return {
     status: "UNKNOWN",
-    sub_code: "TODO_EXTERNAL_CONFIG",
-    message: "无法连接微信支付查询接口，请检查 CloudBase 集成中心配置",
+    sub_code: "REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION",
+    message: "TEST_MODE: 模拟支付查询结果",
   };
 }
 
 /**
- * 发起退款 (Challenge 免单全额返款 & 售后退款)
+ * 发起微信退款 (Challenge 免单全额返款 & 售后退款)
  * @param {Object} cloud - wx-server-sdk 实例
  * @param {Object} params - 退款参数
  */
@@ -154,9 +178,17 @@ async function createRefund(cloud, {
     throw new Error("createRefund: outTradeNo, outRefundNo, totalFee, refundFee 必填");
   }
 
-  try {
+  const fnName = getIntegrationFunctionName();
+
+  if (isLiveMode()) {
+    if (!fnName) {
+      throw new Error(
+        "PAYMENT_INTEGRATION_FUNCTION_NAME_NOT_CONFIGURED: [REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION] 生产环境未配置微信支付退款集成"
+      );
+    }
+
     const res = await cloud.callFunction({
-      name: CLOUDBASE_PAY_MODULE,
+      name: fnName,
       data: {
         action: "wxpay_refund",
         data: {
@@ -180,63 +212,65 @@ async function createRefund(cloud, {
         raw: res.result,
       };
     }
-  } catch (err) {
-    console.warn("[paymentGateway.createRefund] cloudbase_module failed:", err.message);
+    throw new Error("CREATE_REFUND_FAILED");
   }
 
-  // Fallback to pay-common
-  try {
-    const commonRes = await cloud.callFunction({
-      name: PAY_COMMON_FUNCTION,
-      data: {
-        action: "wxpay_refund",
-        out_trade_no: outTradeNo,
-        out_refund_no: outRefundNo,
-        total_fee: totalFee,
-        refund_fee: refundFee,
-        refund_desc: refundDesc,
-      },
-    });
-    if (commonRes && commonRes.result) {
-      return {
-        success: true,
-        refundId: commonRes.result.refund_id || commonRes.result.refundId,
-        status: commonRes.result.status || "PROCESSING",
-        raw: commonRes.result,
-      };
+  if (fnName && cloud && typeof cloud.callFunction === "function") {
+    try {
+      const res = await cloud.callFunction({
+        name: fnName,
+        data: {
+          action: "wxpay_refund",
+          data: {
+            out_trade_no: outTradeNo,
+            out_refund_no: outRefundNo,
+            reason: refundDesc,
+            amount: { refund: refundFee, total: totalFee, currency: "CNY" },
+          },
+        },
+      });
+      if (res && res.result) {
+        return {
+          success: true,
+          refundId: res.result.refund_id || res.result.refundId,
+          status: res.result.status || "PROCESSING",
+          raw: res.result,
+        };
+      }
+    } catch (err) {
+      console.warn("[paymentGateway.createRefund] Integration call warning:", err.message);
     }
-  } catch (commonErr) {
-    console.warn("[paymentGateway.createRefund] pay-common fallback failed:", commonErr.message);
   }
 
-  // 若在 TEST 模式下未接入真实微信商户号，优雅返回模拟状态
-  if (process.env.ACTIVITY_MODE !== "LIVE") {
-    console.log("[paymentGateway.createRefund] TEST_MODE simulated refund success");
-    return {
-      success: true,
-      refundId: `test_wx_rf_${Date.now()}`,
-      status: "PROCESSING",
-      simulated: true,
-      sub_code: "TODO_EXTERNAL_CONFIG",
-    };
-  }
-
-  throw new Error(
-    "TODO_EXTERNAL_CONFIG: 微信支付退款接口调用失败，请在 CloudBase 控制台 -> 集成中心 检查微信支付 Integration 配置"
-  );
+  console.log(`[paymentGateway.createRefund] TEST_MODE: simulated refund for ${outRefundNo}`);
+  return {
+    success: true,
+    refundId: `test_wx_rf_${Date.now()}`,
+    status: "PROCESSING",
+    simulated: true,
+    sub_code: "REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION",
+  };
 }
 
 /**
- * 主动查询微信退款状态 (兜底任务)
+ * 主动查询微信退款状态
  */
 async function queryRefund(cloud, { outRefundNo }) {
   if (!outRefundNo) {
     throw new Error("queryRefund: outRefundNo 必填");
   }
 
-  try {
+  const fnName = getIntegrationFunctionName();
+
+  if (isLiveMode()) {
+    if (!fnName) {
+      throw new Error(
+        "PAYMENT_INTEGRATION_FUNCTION_NAME_NOT_CONFIGURED: [REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION]"
+      );
+    }
+
     const res = await cloud.callFunction({
-      name: CLOUDBASE_PAY_MODULE,
+      name: fnName,
       data: {
         action: "wxpay_refund_query",
         data: {
@@ -247,38 +281,38 @@ async function queryRefund(cloud, { outRefundNo }) {
     if (res && res.result) {
       return {
         status: res.result.status,
-        refundId: res.result.refund_id,
+        refundId: res.result.refund_id || res.result.refundId,
         raw: res.result,
       };
     }
-  } catch (err) {
-    console.warn("[paymentGateway.queryRefund] query failed:", err.message);
+    throw new Error("QUERY_REFUND_FAILED");
   }
 
-  // Fallback to pay-common
-  try {
-    const commonRes = await cloud.callFunction({
-      name: PAY_COMMON_FUNCTION,
-      data: {
-        action: "wxpay_refund_query",
-        out_refund_no: outRefundNo,
-      },
-    });
-    if (commonRes && commonRes.result) {
-      return {
-        status: commonRes.result.status,
-        refundId: commonRes.result.refund_id,
-        raw: commonRes.result,
-      };
+  if (fnName && cloud && typeof cloud.callFunction === "function") {
+    try {
+      const res = await cloud.callFunction({
+        name: fnName,
+        data: {
+          action: "wxpay_refund_query",
+          data: { out_refund_no: outRefundNo },
+        },
+      });
+      if (res && res.result) {
+        return {
+          status: res.result.status,
+          refundId: res.result.refund_id || res.result.refundId,
+          raw: res.result,
+        };
+      }
+    } catch (err) {
+      console.warn("[paymentGateway.queryRefund] Integration call warning:", err.message);
     }
-  } catch (commonErr) {
-    console.warn("[paymentGateway.queryRefund] pay-common query failed:", commonErr.message);
   }
 
   return {
     status: "UNKNOWN",
-    sub_code: "TODO_EXTERNAL_CONFIG",
-    message: "无法查询退款结果，请检查 CloudBase 集成中心配置",
+    sub_code: "REQUIRES_CLOUDBASE_CONSOLE_CONFIGURATION",
+    message: "TEST_MODE: 模拟退款查询结果",
   };
 }
 
@@ -287,4 +321,6 @@ module.exports = {
   queryPayment,
   createRefund,
   queryRefund,
+  isLiveMode,
+  getIntegrationFunctionName,
 };

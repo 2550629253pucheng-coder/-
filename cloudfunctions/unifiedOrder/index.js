@@ -1,4 +1,6 @@
 const cloud = require("wx-server-sdk");
+const Collections = require("../shared/collections");
+const paymentGateway = require("../shared/paymentGateway.js");
 
 cloud.init({
   env: cloud.DYNAMIC_CURRENT_ENV,
@@ -10,8 +12,6 @@ try {
 } catch (error) {
   privateConfig = {};
 }
-
-const paymentGateway = require("../shared/paymentGateway.js");
 
 const workflowName =
   (privateConfig.payment && privateConfig.payment.workflowName) || "wxpay_order";
@@ -42,89 +42,109 @@ function getPaymentDescription(order) {
   return orderNo ? `${firstTitle} ${orderNo}` : firstTitle;
 }
 
-exports.main = async (event, context) => {
-  console.log("[unifiedOrder] event:", event);
-  const { orderId, payerOpenId, totalFee: clientTotalFee } = event || {};
+/**
+ * 构造统一的 unifiedOrder 处理函数（支持依赖注入与真实测试）
+ */
+function createHandler(deps = {}) {
+  const cloudInstance = deps.cloud || cloud;
+  const dbInstance = deps.db || cloudInstance.database();
+  const gateway = deps.paymentGateway || paymentGateway;
 
-  // 1. 简单校验
-  if (!orderId) {
-    console.warn("[unifiedOrder] missing params:", { orderId });
-    return {
-      code: -1,
-      message: "缺少订单ID参数",
-    };
-  }
+  return async function handleUnifiedOrder(event, context) {
+    console.log("[unifiedOrder] event:", event);
+    // [P0 支付身份安全] 严禁从 event 中解构或信任 payerOpenId，付款人身份严格以微信鉴权上下文为准！
+    const { orderId, totalFee: clientTotalFee } = event || {};
 
-  const wxContext = cloud.getWXContext();
-  const openId = wxContext.OPENID;
+    if (!orderId) {
+      console.warn("[unifiedOrder] missing params:", { orderId });
+      return {
+        code: -1,
+        message: "缺少订单ID参数",
+      };
+    }
 
-  // [New] 2. 安全校验：确保订单存在且属于当前用户
-  const db = cloud.database();
-  const orderRes = await db
-    .collection("order")
-    .where({
-      _id: orderId,
-      _openid: openId,
-      status: "PENDING_PAYMENT", // 只能支付待支付的订单
-    })
-    .get();
+    const wxContext = cloudInstance.getWXContext();
+    const openId = wxContext.OPENID;
 
-  if (!orderRes.data || orderRes.data.length === 0) {
-    console.warn("[unifiedOrder] order not found or permission denied:", {
-      orderId,
-      openId,
-    });
-    return {
-      code: -1,
-      message: "订单不存在或无法支付",
-    };
-  }
+    if (!openId) {
+      console.warn("[unifiedOrder] unauthenticated caller");
+      return {
+        code: -1,
+        message: "无法获取支付身份",
+      };
+    }
 
-  const order = orderRes.data[0];
-  let totalFee;
-  try {
-    totalFee = getOrderTotalFee(order);
-  } catch (error) {
-    console.warn("[unifiedOrder] invalid order amount:", {
-      orderId,
-      orderSummary: order && order.orderSummary,
-      message: error.message,
-    });
-    return {
-      code: -1,
-      message: "订单金额异常",
-    };
-  }
+    // 2. 安全校验：确保订单存在且严格归属于当前用户（防止越权代付或偷梁换柱）
+    const orderRes = await dbInstance
+      .collection(Collections.ORDER)
+      .where({
+        _id: orderId,
+        _openid: openId,
+        status: "PENDING_PAYMENT", // 只能支付待支付的订单
+      })
+      .get();
 
-  if (
-    Number.isFinite(Number(clientTotalFee)) &&
-    Number(clientTotalFee) !== totalFee
-  ) {
-    console.warn("[unifiedOrder] ignore mismatched client totalFee:", {
-      orderId,
-      clientTotalFee,
-      serverTotalFee: totalFee,
-    });
-  }
+    if (!orderRes.data || orderRes.data.length === 0) {
+      console.warn("[unifiedOrder] order not found or permission denied:", {
+        orderId,
+        openId,
+      });
+      return {
+        code: -1,
+        message: "订单不存在或无法支付",
+      };
+    }
 
-  console.log("[unifiedOrder] calling payment gateway:", wxContext.OPENID);
+    const order = orderRes.data[0];
+    let totalFee;
+    try {
+      totalFee = getOrderTotalFee(order);
+    } catch (error) {
+      console.warn("[unifiedOrder] invalid order amount:", {
+        orderId,
+        orderSummary: order && order.orderSummary,
+        message: error.message,
+      });
+      return {
+        code: -1,
+        message: "订单金额异常",
+      };
+    }
 
-  try {
-    const payResult = await paymentGateway.createPayment(cloud, {
-      orderId,
-      totalFee,
-      description: getPaymentDescription(order),
-      openId: payerOpenId || openId,
-      workflowName,
-    });
+    if (
+      Number.isFinite(Number(clientTotalFee)) &&
+      Number(clientTotalFee) !== totalFee
+    ) {
+      console.warn("[unifiedOrder] ignore mismatched client totalFee:", {
+        orderId,
+        clientTotalFee,
+        serverTotalFee: totalFee,
+      });
+    }
 
-    console.log("[unifiedOrder] payment gateway result:", payResult);
-    return payResult;
-  } catch (payErr) {
-    console.error("[unifiedOrder] payment gateway failed:", payErr);
-    return {
-      code: -1,
-      message: payErr.message || "发起支付失败",
-    };
-  }
-};
+    console.log("[unifiedOrder] calling payment gateway with authenticated openId:", openId);
+
+    try {
+      // 3. 严格使用 wxContext.OPENID 发起支付，杜绝任何外部 openId 覆盖
+      const payResult = await gateway.createPayment(cloudInstance, {
+        orderId,
+        totalFee,
+        description: getPaymentDescription(order),
+        openId,
+        workflowName,
+      });
+
+      console.log("[unifiedOrder] payment gateway result:", payResult);
+      return payResult;
+    } catch (payErr) {
+      console.error("[unifiedOrder] payment gateway failed:", payErr);
+      return {
+        code: -1,
+        message: payErr.message || "发起支付失败",
+      };
+    }
+  };
+}
+
+exports.createHandler = createHandler;
+exports.main = createHandler();
