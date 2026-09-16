@@ -31,6 +31,32 @@ const {
   resolvePaidAmountCents,
   buildChallengeRefundDoc,
 } = require("./lib/refund");
+const paymentGateway = require("./lib/paymentGateway");
+
+/**
+ * 数据库事务执行器 (支持 CloudBase 事务并在非事务测试环境下安全 fallback)
+ */
+async function runWithTransaction(database, fn) {
+  if (typeof database.startTransaction === "function") {
+    const transaction = await database.startTransaction();
+    try {
+      const result = await fn(transaction);
+      await transaction.commit();
+      return result;
+    } catch (err) {
+      if (typeof transaction.rollback === "function") {
+        try {
+          await transaction.rollback();
+        } catch (rbErr) {
+          console.warn("[runWithTransaction] rollback error:", rbErr.message);
+        }
+      }
+      throw err;
+    }
+  } else {
+    return await fn(database);
+  }
+}
 
 // 集合定义
 const ORDER_COLLECTION = "order";
@@ -155,7 +181,23 @@ async function handleStartSession(openId, { orderId }) {
   }
 
   if (order.status !== "PENDING_DELIVERY") {
-    throw new Error("订单尚未完成支付或状态不合法，无法发起免单挑战");
+    throw new Error("CHALLENGE_NOT_STARTABLE: ORDER_NOT_PAID");
+  }
+
+  if (!order.challengeEligible) {
+    throw new Error("CHALLENGE_NOT_STARTABLE: ORDER_NOT_ELIGIBLE");
+  }
+
+  if (
+    order.challengeStatus !== ChallengeStatus.ELIGIBLE &&
+    order.challengeStatus !== ChallengeStatus.READY_TO_RESTART &&
+    order.challengeStatus !== ChallengeStatus.IN_PROGRESS
+  ) {
+    throw new Error(`CHALLENGE_NOT_STARTABLE: ORDER_STATUS_${order.challengeStatus}`);
+  }
+
+  if (order.fulfillmentHold !== FulfillmentHoldStatus.CHALLENGE_PENDING) {
+    throw new Error(`CHALLENGE_NOT_STARTABLE: FULFILLMENT_HOLD_${order.fulfillmentHold}`);
   }
 
   // 确定性 Session ID（一单仅一会话，彻底消除 Session 漂移与并发多会话）
@@ -184,6 +226,19 @@ async function handleStartSession(openId, { orderId }) {
   const now = Date.now();
 
   if (existingSession) {
+    // [P0 安全原则] 检查 Session 与 Order 状态冲突 (如 Order 已终结但 Session 处于重启或进行中)
+    if (
+      (order.challengeStatus === ChallengeStatus.LOSE || order.challengeStatus === ChallengeStatus.WIN) &&
+      (existingSession.challengeStatus === ChallengeStatus.READY_TO_RESTART || existingSession.challengeStatus === ChallengeStatus.IN_PROGRESS)
+    ) {
+      console.error("[handleStartSession] SESSION_ORDER_STATUS_CONFLICT:", {
+        orderId,
+        orderStatus: order.challengeStatus,
+        sessionStatus: existingSession.challengeStatus,
+      });
+      throw new Error("CHALLENGE_NOT_STARTABLE: SESSION_ORDER_STATUS_CONFLICT");
+    }
+
     // 1. 如果已经是终态，直接幂等返回结果，绝不重新挑战
     if (
       existingSession.challengeStatus === ChallengeStatus.WIN ||
@@ -252,7 +307,7 @@ async function handleStartSession(openId, { orderId }) {
 
     // 5. 关键逻辑：若会话处于 READY_TO_RESTART（resume 成功后，用户明确点击“开始挑战”）：
     if (existingSession.challengeStatus === ChallengeStatus.READY_TO_RESTART) {
-      const ruleSnapshot = existingSession.ruleSnapshot;
+      const ruleSnapshot = existingSession.ruleSnapshot || order.challengeRuleSnapshot;
       const serverStartResponseSentAt = now;
       const nonce = crypto.randomBytes(16).toString("hex");
 
@@ -305,34 +360,27 @@ async function handleStartSession(openId, { orderId }) {
     }
   }
 
-  // 严格资格校验：对于尚未创建 Session 的订单，必须处于 ELIGIBLE 且具备挑战资格
-  if (!order.challengeEligible) {
-    throw new Error("该订单不满足免单挑战参与条件或资格已消费");
+  // 规则快照锁定：优先且强制使用订单支付时冻结的 challengeRuleSnapshot
+  let ruleSnapshot = order.challengeRuleSnapshot;
+  if (!ruleSnapshot) {
+    const isLive = process.env.NODE_ENV === "production" || process.env.ACTIVITY_MODE === "LIVE" || ACTIVITY_MODE === "LIVE";
+    if (isLive) {
+      throw new Error("CHALLENGE_NOT_STARTABLE: CHALLENGE_RULE_SNAPSHOT_MISSING");
+    }
+    const fallbackRule = await getEffectiveRule();
+    ruleSnapshot = {
+      ruleId: fallbackRule.ruleId || "RULE_3S_TEST_V1",
+      gameType: fallbackRule.gameType || "THREE_SECOND_HOLD",
+      ruleVersion: order.challengeRuleVersion || fallbackRule.ruleVersion || "TEST_V1",
+      targetTimeMs: Number(fallbackRule.targetTimeMs) || 3000,
+      successMinMs: Number(fallbackRule.successMinMs) || 2990,
+      successMaxMs: Number(fallbackRule.successMaxMs) || 3010,
+      maxRoundDurationMs: Number(fallbackRule.maxRoundDurationMs) || 10000,
+      timingToleranceMs: Number(fallbackRule.timingToleranceMs) || 1000,
+      negativeToleranceMs: Number(fallbackRule.negativeToleranceMs) || 100,
+      maxResumeCount: Number(fallbackRule.maxResumeCount) || 1,
+    };
   }
-
-  if (
-    order.challengeStatus === ChallengeStatus.LOSE ||
-    order.challengeStatus === ChallengeStatus.WIN ||
-    order.challengeStatus === ChallengeStatus.EXPIRED
-  ) {
-    throw new Error("该订单挑战已完结，无法再次发起挑战");
-  }
-
-  // 全新创建挑战会话并锁定规则版本 (优先读取支付成功时锁定的 challengeRuleVersion)
-  const lockedRuleVersion = order.challengeRuleVersion;
-  const rule = await getEffectiveRule();
-  const ruleSnapshot = {
-    ruleId: rule.ruleId,
-    gameType: rule.gameType,
-    ruleVersion: lockedRuleVersion || rule.ruleVersion,
-    targetTimeMs: rule.targetTimeMs,
-    successMinMs: rule.successMinMs,
-    successMaxMs: rule.successMaxMs,
-    maxRoundDurationMs: rule.maxRoundDurationMs,
-    timingToleranceMs: rule.timingToleranceMs,
-    negativeToleranceMs: rule.negativeToleranceMs,
-    maxResumeCount: rule.maxResumeCount || 1,
-  };
 
   const serverStartResponseSentAt = now;
   const nonce = crypto.randomBytes(16).toString("hex");
@@ -541,38 +589,130 @@ async function handleSubmitChallenge(openId, payload) {
   });
 
   const now = Date.now();
+  const targetOrderId = session.orderId || orderId;
+  const orderRes = await db.collection(ORDER_COLLECTION).doc(targetOrderId).get();
+  const order = orderRes.data;
+  if (!order) {
+    throw new Error("ORDER_NOT_FOUND");
+  }
 
-  // 7. 更新 Session 至终态
-  await db.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).update({
-    data: {
-      challengeStatus: settlement.challengeStatus,
-      result: settlement.result,
-      deviceInfo: deviceInfo || null,
-      networkInfo: networkInfo || null,
-      settledTime: now,
-      updatedAt: now,
-    },
+  const isLive = process.env.NODE_ENV === "production" || process.env.ACTIVITY_MODE === "LIVE" || ACTIVITY_MODE === "LIVE";
+  const paidCents = resolvePaidAmountCents(order, isLive);
+  const isTestMode = session.activityMode === "TEST" || ACTIVITY_MODE === "TEST";
+  const { refundDocId, outRefundNo, refundTaskId } = buildDeterministicRefundKeys({
+    sessionId: session._id,
+    orderId: targetOrderId,
   });
 
-  // 8. 同步更新订单状态机与履约暂扣标记（永久消费资格 challengeEligible: false）
-  await db.collection(ORDER_COLLECTION).doc(session.orderId).update({
-    data: {
-      challengeStatus: settlement.challengeStatus,
-      challengeEligible: false, // [P0] 终态永久消费资格
-      challengeRefundStatus: settlement.challengeRefundStatus,
-      fulfillmentHold: settlement.fulfillmentHold,
-      erpStatus: settlement.erpStatus,
-      updatedAt: now,
-    },
-  });
+  let taskDocToDispatch = null;
+  let refundDocToReturn = null;
 
-  // 9. 若获胜 WIN，触发退款任务队列
-  let refundInfo = null;
-  if (settlement.challengeStatus === ChallengeStatus.WIN) {
-    refundInfo = await createAndQueueChallengeRefund({
-      session,
-      result: settlement.result,
+  // 7. [P0 核心安全] 结算原子事务化：Session + Order + Refunds + RefundTask 在同一事务内提交
+  await runWithTransaction(db, async (t) => {
+    // 7.1 更新 Session 至终态
+    await t.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).update({
+      data: {
+        challengeStatus: settlement.challengeStatus,
+        result: settlement.result,
+        deviceInfo: deviceInfo || null,
+        networkInfo: networkInfo || null,
+        settledTime: now,
+        settledAt: now,
+        updatedAt: now,
+      },
     });
+
+    // 7.2 同步更新订单状态机与履约暂扣标记（永久消费资格 challengeEligible: false）
+    let orderUpdateData;
+    if (settlement.challengeStatus === ChallengeStatus.WIN) {
+      orderUpdateData = {
+        challengeStatus: ChallengeStatus.WIN,
+        challengeEligible: false, // 终态永久消费资格
+        challengeRefundStatus: ChallengeRefundStatus.PENDING,
+        fulfillmentHold: FulfillmentHoldStatus.REFUND_PENDING,
+        erpStatus: ErpStatus.HOLD,
+        updatedAt: now,
+      };
+    } else if (settlement.challengeStatus === ChallengeStatus.LOSE) {
+      orderUpdateData = {
+        challengeStatus: ChallengeStatus.LOSE,
+        challengeEligible: false,
+        challengeRefundStatus: ChallengeRefundStatus.NONE,
+        fulfillmentHold: FulfillmentHoldStatus.NONE,
+        erpStatus: ErpStatus.READY,
+        updatedAt: now,
+      };
+    } else {
+      orderUpdateData = {
+        challengeStatus: ChallengeStatus.PENDING_REVIEW,
+        challengeEligible: false,
+        challengeRefundStatus: ChallengeRefundStatus.NONE,
+        fulfillmentHold: FulfillmentHoldStatus.SAFE_SETTLEMENT,
+        erpStatus: ErpStatus.HOLD,
+        updatedAt: now,
+      };
+    }
+
+    await t.collection(ORDER_COLLECTION).doc(targetOrderId).update({
+      data: orderUpdateData,
+    });
+
+    // 7.3 若获胜 WIN，在同一事务内生成确定的退款单和退款任务
+    if (settlement.challengeStatus === ChallengeStatus.WIN) {
+      const refundDoc = {
+        _id: refundDocId,
+        orderId: targetOrderId,
+        sessionId: session._id,
+        sourceType: "CHALLENGE_FREE_ORDER",
+        outRefundNo,
+        amount: paidCents,
+        amountYuan: (paidCents / 100).toFixed(2),
+        status: "PENDING",
+        wechatRefundId: null,
+        errorCode: null,
+        errorMessage: null,
+        testMode: isTestMode,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await t.collection(REFUNDS_COLLECTION).doc(refundDocId).set({
+        data: refundDoc,
+      });
+
+      const taskDoc = {
+        _id: refundTaskId,
+        orderId: targetOrderId,
+        sessionId: session._id,
+        outRefundNo,
+        amountCents: paidCents,
+        status: "PENDING",
+        retryCount: 0,
+        maxRetries: 5,
+        lastError: null,
+        nextRetryAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await t.collection("refund_tasks").doc(refundTaskId).set({
+        data: taskDoc,
+      });
+
+      taskDocToDispatch = taskDoc;
+      refundDocToReturn = refundDoc;
+    }
+  });
+
+  // 8. 事务 Commit 成功后，才允许向支付网关派发退款任务
+  let refundInfo = null;
+  if (settlement.challengeStatus === ChallengeStatus.WIN && taskDocToDispatch) {
+    const dispatchRes = await dispatchRefundTask(taskDocToDispatch, session, order);
+    refundInfo = {
+      refundId: refundDocId,
+      outRefundNo,
+      amountCents: paidCents,
+      amountYuan: refundDocToReturn.amountYuan,
+      status: dispatchRes.status,
+    };
   }
 
   return {
@@ -588,97 +728,27 @@ async function handleSubmitChallenge(openId, payload) {
 }
 
 /**
- * 3. 创建挑战免单退款并排队任务 (refund_tasks 模式)
- */
-async function createAndQueueChallengeRefund({ session, result }) {
-  const orderId = session.orderId;
-  const orderRes = await db.collection(ORDER_COLLECTION).doc(orderId).get();
-  const order = orderRes.data;
-  if (!order) return null;
-
-  // 严格确定金额 (服务端校验实际已支付金额，绝不信客户端)
-  const paidCents = resolvePaidAmountCents(order);
-  const isTestMode = session.activityMode === "TEST" || ACTIVITY_MODE === "TEST";
-
-  // 构建确定性退款单据 (CR_{orderId})
-  const { outRefundNo, refundIdempotencyKey } = buildDeterministicRefundKeys({
-    orderId,
-    challengeId: session._id,
-  });
-
-  const refundDoc = buildChallengeRefundDoc({
-    sessionId: session._id,
-    orderId,
-    paidCents,
-    isTestMode,
-    testRefundMode: TEST_REFUND_MODE,
-  });
-
-  // 1. 幂等插入 refunds 集合
-  try {
-    await db.collection(REFUNDS_COLLECTION).doc(refundDoc._id).set({
-      data: refundDoc,
-    });
-  } catch (err) {
-    console.warn("[createAndQueueChallengeRefund] Refund doc might already exist:", err.message);
-  }
-
-  // 2. 写入 refund_tasks 任务表
-  const taskId = `TASK_${outRefundNo}`;
-  const now = Date.now();
-  const taskDoc = {
-    _id: taskId,
-    orderId,
-    sessionId: session._id,
-    outRefundNo,
-    amountCents: paidCents,
-    status: "PENDING",
-    retryCount: 0,
-    maxRetries: 5,
-    lastError: null,
-    nextRetryAt: now,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  try {
-    await db.collection("refund_tasks").doc(taskId).set({
-      data: taskDoc,
-    });
-  } catch (taskErr) {
-    console.warn("[createAndQueueChallengeRefund] refund_task set warning:", taskErr.message);
-  }
-
-  // 3. 触发退款任务派发
-  const dispatchResult = await dispatchRefundTask(taskDoc, session, order);
-
-  return {
-    refundId: refundDoc._id,
-    outRefundNo,
-    amountCents: paidCents,
-    amountYuan: refundDoc.amountYuan,
-    status: dispatchResult.status,
-  };
-}
-
-/**
- * 3.1 派发并处理退款任务
+ * 3. 派发并处理退款任务 (通过统一 paymentGateway 执行)
  */
 async function dispatchRefundTask(taskDoc, session, order) {
   const isTestMode = session.activityMode === "TEST" || ACTIVITY_MODE === "TEST";
   const now = Date.now();
+  const { refundDocId, outRefundNo, refundTaskId } = buildDeterministicRefundKeys({
+    sessionId: session._id,
+    orderId: taskDoc.orderId,
+  });
 
-  // TEST 模式：根据配置模拟
+  // TEST 模式：自动成功模拟
   if (isTestMode) {
     if (TEST_REFUND_MODE === "AUTO_SUCCESS") {
-      await db.collection(REFUNDS_COLLECTION).doc(taskDoc.outRefundNo ? `CR_${taskDoc.orderId}` : "").update({
+      await db.collection(REFUNDS_COLLECTION).doc(refundDocId).update({
         data: {
           status: "SUCCESS",
           updatedAt: now,
         },
       });
 
-      await db.collection("refund_tasks").doc(taskDoc._id).update({
+      await db.collection("refund_tasks").doc(refundTaskId).update({
         data: {
           status: "SUCCESS",
           updatedAt: now,
@@ -691,8 +761,8 @@ async function dispatchRefundTask(taskDoc, session, order) {
           fulfillmentHold: FulfillmentHoldStatus.NONE, // 退款成功才允许释放暂扣！
           erpStatus: ErpStatus.READY,
           challengeRefundInfo: {
-            refundId: `CR_${taskDoc.orderId}`,
-            outRefundNo: taskDoc.outRefundNo,
+            refundId: refundDocId,
+            outRefundNo,
             amountCents: taskDoc.amountCents,
             successTime: now,
           },
@@ -702,13 +772,13 @@ async function dispatchRefundTask(taskDoc, session, order) {
 
       return { status: "SUCCESS" };
     } else if (TEST_REFUND_MODE === "FAILURE") {
-      await db.collection(REFUNDS_COLLECTION).doc(`CR_${taskDoc.orderId}`).update({
+      await db.collection(REFUNDS_COLLECTION).doc(refundDocId).update({
         data: {
           status: "FAILED",
           updatedAt: now,
         },
       });
-      await db.collection("refund_tasks").doc(taskDoc._id).update({
+      await db.collection("refund_tasks").doc(refundTaskId).update({
         data: {
           status: "FAILED",
           lastError: "SIMULATED_TEST_FAILURE",
@@ -721,38 +791,87 @@ async function dispatchRefundTask(taskDoc, session, order) {
     return { status: "PENDING" };
   }
 
-  // LIVE 模式：真实发起微信支付退款，状态保持 PROCESSING，发货坚决锁定
+  // LIVE 模式：通过统一 paymentGateway 发起退款
+  await db.collection("refund_tasks").doc(refundTaskId).update({
+    data: {
+      status: "PROCESSING",
+      updatedAt: now,
+    },
+  });
+
   try {
-    if (cloud.cloudPay && typeof cloud.cloudPay.refund === "function") {
-      await cloud.cloudPay.refund({
-        out_trade_no: taskDoc.orderId,
-        out_refund_no: taskDoc.outRefundNo,
-        total_fee: taskDoc.amountCents,
-        refund_fee: taskDoc.amountCents,
-        refund_desc: "3秒挑战免单全额返款",
-      });
-      await db.collection("refund_tasks").doc(taskDoc._id).update({
+    const refundRes = await paymentGateway.createRefund(cloud, {
+      outTradeNo: taskDoc.orderId,
+      outRefundNo,
+      totalFee: taskDoc.amountCents,
+      refundFee: taskDoc.amountCents,
+      refundDesc: "3秒挑战免单全额返款",
+      reason: "CHALLENGE_FREE_ORDER",
+    });
+
+    console.log("[dispatchRefundTask] paymentGateway.createRefund result:", refundRes);
+
+    if (refundRes && (refundRes.status === "SUCCESS" || (refundRes.simulated && TEST_REFUND_MODE === "AUTO_SUCCESS"))) {
+      await db.collection(REFUNDS_COLLECTION).doc(refundDocId).update({
         data: {
-          status: "PROCESSING",
+          status: "SUCCESS",
+          wechatRefundId: refundRes.refundId || null,
           updatedAt: now,
         },
       });
-      return { status: "PROCESSING" };
+      await db.collection("refund_tasks").doc(refundTaskId).update({
+        data: {
+          status: "SUCCESS",
+          wechatRefundId: refundRes.refundId || null,
+          updatedAt: now,
+        },
+      });
+      await db.collection(ORDER_COLLECTION).doc(taskDoc.orderId).update({
+        data: {
+          challengeRefundStatus: ChallengeRefundStatus.SUCCESS,
+          fulfillmentHold: FulfillmentHoldStatus.NONE,
+          erpStatus: ErpStatus.READY,
+          challengeRefundInfo: {
+            refundId: refundDocId,
+            outRefundNo,
+            amountCents: taskDoc.amountCents,
+            successTime: now,
+          },
+          updatedAt: now,
+        },
+      });
+      return { status: "SUCCESS" };
     }
+
+    return { status: "PROCESSING" };
   } catch (wxErr) {
-    console.error("[dispatchRefundTask] cloud.cloudPay.refund failed:", wxErr);
-    await db.collection("refund_tasks").doc(taskDoc._id).update({
+    console.error("[dispatchRefundTask] paymentGateway.createRefund failed:", wxErr);
+    const retryCount = (taskDoc.retryCount || 0) + 1;
+    const maxRetries = taskDoc.maxRetries || 5;
+    const nextStatus = retryCount >= maxRetries ? "DEAD_LETTER" : "RETRY";
+
+    await db.collection("refund_tasks").doc(refundTaskId).update({
       data: {
-        status: "RETRY",
-        retryCount: (taskDoc.retryCount || 0) + 1,
+        status: nextStatus,
+        retryCount,
         lastError: wxErr.message,
-        nextRetryAt: now + 30000,
+        nextRetryAt: now + (nextStatus === "RETRY" ? 30000 * retryCount : 0),
         updatedAt: now,
       },
     });
-  }
 
-  return { status: "PROCESSING" };
+    if (nextStatus === "DEAD_LETTER") {
+      await db.collection(ORDER_COLLECTION).doc(taskDoc.orderId).update({
+        data: {
+          fulfillmentHold: FulfillmentHoldStatus.REFUND_PENDING,
+          erpStatus: ErpStatus.HOLD,
+          updatedAt: now,
+        },
+      });
+    }
+
+    return { status: nextStatus, error: wxErr.message };
+  }
 }
 
 /**
@@ -965,17 +1084,14 @@ async function handleSkipChallenge(openId, { orderId }) {
   }
 
   const now = Date.now();
+  const sessionId = `CHALLENGE_SESSION_${orderId}`;
 
-  // 条件原子更新：确保订单未被其他操作修改，且永久消费资格
-  const updateRes = await db
-    .collection(ORDER_COLLECTION)
-    .where({
-      _id: orderId,
-      _openid: openId,
-    })
-    .update({
+  // [P0 核心修复] 事务同步原子修改：order + challenge_session
+  await runWithTransaction(db, async (t) => {
+    // 1. 更新订单：永久消费资格，标记 LOSE 与 USER_SKIPPED，解除发货锁定
+    await t.collection(ORDER_COLLECTION).doc(orderId).update({
       data: {
-        challengeEligible: false, // [P0] 永久消费资格，严禁二次发起
+        challengeEligible: false, // 永久消费资格，严禁二次发起
         challengeStatus: ChallengeStatus.LOSE,
         challengeRefundStatus: ChallengeRefundStatus.NONE,
         settlementReason: "USER_SKIPPED",
@@ -985,23 +1101,19 @@ async function handleSkipChallenge(openId, { orderId }) {
       },
     });
 
-  if (updateRes.stats && updateRes.stats.updated === 0) {
-    throw new Error("SKIP_FAILED_STATE_CONFLICT");
-  }
-
-  // 同步如果已有 Session，Session 也置为 LOSE 终态
-  const sessionId = `CHALLENGE_SESSION_${orderId}`;
-  try {
-    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).update({
-      data: {
-        challengeStatus: ChallengeStatus.LOSE,
-        settlementReason: "USER_SKIPPED",
-        updatedAt: now,
-      },
-    });
-  } catch (sessErr) {
-    // Session 尚未创建时安全忽略
-  }
+    // 2. 如果存在关联 Session，同一事务内同步置为 LOSE 终态，彻底防止 Session 孤立被刷
+    try {
+      await t.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).update({
+        data: {
+          challengeStatus: ChallengeStatus.LOSE,
+          settlementReason: "USER_SKIPPED",
+          updatedAt: now,
+        },
+      });
+    } catch (sessErr) {
+      // 若 Session 尚未创建可安全忽略
+    }
+  });
 
   return { success: true };
 }

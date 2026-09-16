@@ -61,52 +61,6 @@ exports.main = async (event, context) => {
     };
   }
 
-  // [P0 安全防线] 检查是否混购挑战免单活动商品：
-  // 规则：为防止“1件免单商品+多件高价值普通商品”整单退款套利，挑战活动商品必须独立单件下单！
-  try {
-    const now = Date.now();
-    const activeChallengeRes = await db
-      .collection("activities")
-      .where({
-        type: "THREE_SECOND_CHALLENGE",
-        status: "ACTIVE",
-        startTime: _.lte(now),
-        endTime: _.gte(now),
-      })
-      .limit(1)
-      .get();
-
-    if (activeChallengeRes.data && activeChallengeRes.data.length > 0) {
-      const challengeActivity = activeChallengeRes.data[0];
-      const applicableSpuIds = challengeActivity.applicableSpuIds || [];
-
-      if (applicableSpuIds.length > 0) {
-        const containsChallengeItem = goodsList.some((g) =>
-          applicableSpuIds.includes(g.spuId)
-        );
-
-        if (containsChallengeItem) {
-          const totalCount = goodsList.reduce(
-            (sum, item) => sum + Number(item.quantity || 0),
-            0
-          );
-          if (goodsList.length > 1 || totalCount > 1) {
-            console.warn("[createOrder] Mixed cart challenge arbitrage blocked:", {
-              goodsCount: goodsList.length,
-              totalCount,
-            });
-            return {
-              success: false,
-              message: "参与免单挑战的商品请单独下单，每单限购1件",
-            };
-          }
-        }
-      }
-    }
-  } catch (checkErr) {
-    console.warn("[createOrder] check challenge activity failed, non-blocking:", checkErr);
-  }
-
   const wxContext = cloud.getWXContext();
   const openId = wxContext.OPENID;
   console.log("[createOrder] openId:", openId);
@@ -152,90 +106,137 @@ exports.main = async (event, context) => {
 
   try {
     console.log(
-      "[createOrder] start transaction, goods count:",
+      "[createOrder] start transaction, input goods count:",
       goodsList.length
     );
-    let goodsTotalAmount = 0;
-    // 1. 循环处理商品库存
-    // 1. 循环处理商品库存
-    for (const item of goodsList) {
-      if (!item.skuId || !item.quantity) continue;
 
-      // 1.1 查询最新 SKU 库存
-      // 注意：使用 goods_sku 集合，先根据 skuId (业务主键) 查询系统 _id
-      console.log("[createOrder] checking stock:", {
-        skuId: item.skuId,
-        quantity: item.quantity,
-        title: item.title,
-      });
-      const queryRes = await transaction
+    // [P0 安全架构] 核心商品数据服务端 Canonical 化：
+    // 客户端只信任 skuId 与 quantity，所有 SPU、价格、标题、主图、规格信息一律由数据库重建！
+    const canonicalGoodsList = [];
+    let goodsTotalAmount = 0;
+
+    for (const rawItem of goodsList) {
+      const skuId = rawItem.skuId;
+      const quantity = parseInt(rawItem.quantity, 10);
+      if (!skuId || !quantity || quantity <= 0) {
+        throw new Error("商品规格或数量参数非法");
+      }
+
+      // 1.1 查询权威 SKU 数据
+      const skuQuery = await transaction
         .collection("goods_sku")
-        .where({
-          skuId: item.skuId,
-        })
+        .where({ skuId })
         .get();
 
-      if (!queryRes.data || queryRes.data.length === 0) {
-        throw new Error(`商品规格不存在: ${item.title}`);
+      if (!skuQuery.data || skuQuery.data.length === 0) {
+        throw new Error(`商品规格不存在或已下架 (SKU: ${skuId})`);
       }
 
-      const skuData = queryRes.data[0];
-      const realId = skuData._id;
+      const skuData = skuQuery.data[0];
+      const realSkuDocId = skuData._id;
+      const spuId = skuData.spuId;
 
-      // 1.2 检查库存 (字段为 stock)
+      // 1.2 校验库存
       const currentStock = skuData.stock || 0;
-      if (currentStock < item.quantity) {
-        throw new Error(`商品 "${item.title}" 库存不足 (仅剩${currentStock})`);
+      if (currentStock < quantity) {
+        throw new Error(`商品库存不足 (仅剩${currentStock})`);
       }
 
-      // [NEW] 1.3 价格安全校验
-      // 防止前端篡改价格。这里使用严格比较，允许 0.01 的浮动误差（通常不需要，但为了保险）
-      // 注意：数据库存储的价格单位通常是元还是分？Deshan项目中 minSalePrice 看起来是元 (e.g. 99.00)
-      // item.price 来自前端购物车，也是元。
+      // 1.3 权威价格计算（完全以服务端 DB 价格为准，杜绝任何客户端价格欺诈）
       const dbPrice = parseFloat(skuData.price);
-      const clientPrice = parseFloat(item.price);
-
-      if (Math.abs(dbPrice - clientPrice) > 0.01) {
-        console.warn(
-          `[createOrder] Price mismatch for ${item.title}: DB=${dbPrice}, Client=${clientPrice}`
-        );
-        // 暂时记录日志，或者直接抛错拒绝订单
-        throw new Error(`商品 "${item.title}" 价格变动，请重新下单`);
+      if (Number.isNaN(dbPrice) || dbPrice < 0) {
+        throw new Error("商品价格配置异常");
       }
 
-      goodsTotalAmount = roundCurrency(
-        goodsTotalAmount + dbPrice * Number(item.quantity || 0)
-      );
+      // 1.4 查询权威 SPU 数据以锁定商品标题与主图
+      let spuData = null;
+      if (spuId) {
+        try {
+          const spuRes = await transaction.collection("goods_spu").doc(spuId).get();
+          spuData = spuRes.data || null;
+        } catch (spuErr) {
+          console.warn(`[createOrder] Fetch spu ${spuId} warning:`, spuErr.message);
+        }
+      }
 
-      // 1.4 扣减库存 (使用系统 _id)
+      const canonicalItem = {
+        skuId: skuData.skuId || skuId,
+        spuId: spuId || "",
+        title: spuData ? (spuData.title || spuData.name || "商品") : (rawItem.title || "商品"),
+        primaryImage: spuData ? (spuData.primaryImage || (Array.isArray(spuData.images) && spuData.images[0]) || "") : (rawItem.primaryImage || ""),
+        price: formatAmount(dbPrice),
+        quantity,
+        specInfo: skuData.specInfo || skuData.spec || [],
+      };
+
+      canonicalGoodsList.push(canonicalItem);
+      goodsTotalAmount = roundCurrency(goodsTotalAmount + dbPrice * quantity);
+
+      // 1.5 扣减 SKU 库存
       await transaction
         .collection("goods_sku")
-        .doc(realId)
+        .doc(realSkuDocId)
         .update({
           data: {
-            stock: _.inc(-item.quantity),
+            stock: _.inc(-quantity),
           },
         });
 
-      // 1.5 扣减 SPU 总库存 (可选，Deshan 项目 spuStockQuantity 字段)
-      const spuId = skuData.spuId;
+      // 1.6 同步扣减 SPU 库存
       if (spuId) {
-        // 需要先查一次 SPu 吗？如果不查直接 update 可能 fail 如果 spuId 不对？
-        // 这里假设 spuId 是正确的 _id
-        await transaction
-          .collection("goods_spu")
-          .doc(spuId)
-          .update({
-            data: {
-              spuStockQuantity: _.inc(-item.quantity),
-            },
-          });
+        try {
+          await transaction
+            .collection("goods_spu")
+            .doc(spuId)
+            .update({
+              data: {
+                spuStockQuantity: _.inc(-quantity),
+              },
+            });
+        } catch (spuStockErr) {
+          console.warn("[createOrder] deduct spuStock non-blocking:", spuStockErr.message);
+        }
+      }
+    }
+
+    // [P0 防套利防线] 基于服务端重建的 canonicalGoodsList 判定免单活动商品单件下单规则
+    const now = Date.now();
+    const activeChallengeRes = await transaction
+      .collection("activities")
+      .where({
+        type: "THREE_SECOND_CHALLENGE",
+        status: "ACTIVE",
+        startTime: _.lte(now),
+        endTime: _.gte(now),
+      })
+      .limit(1)
+      .get();
+
+    if (activeChallengeRes.data && activeChallengeRes.data.length > 0) {
+      const challengeActivity = activeChallengeRes.data[0];
+      const applicableSpuIds = challengeActivity.applicableSpuIds || [];
+
+      if (applicableSpuIds.length > 0) {
+        const containsChallengeItem = canonicalGoodsList.some((g) =>
+          applicableSpuIds.includes(g.spuId)
+        );
+
+        if (containsChallengeItem) {
+          const totalCount = canonicalGoodsList.reduce(
+            (sum, item) => sum + item.quantity,
+            0
+          );
+          if (canonicalGoodsList.length > 1 || totalCount > 1) {
+            console.warn("[createOrder] Arbitrage blocked: mixed cart or quantity > 1");
+            throw new Error("CHALLENGE_MIXED_CART_FORBIDDEN: 3秒挑战免单活动商品不可与其他商品混购，且单笔限购1件");
+          }
+        }
       }
     }
 
     const normalizedDeliveryType = Number(orderData.deliveryType) === 2 ? 2 : 1;
-    const totalGoodsCount = goodsList.reduce(
-      (sum, item) => sum + Number(item.quantity || 0),
+    const totalGoodsCount = canonicalGoodsList.reduce(
+      (sum, item) => sum + item.quantity,
       0
     );
     const computedOrderSummary = {
@@ -245,13 +246,17 @@ exports.main = async (event, context) => {
       }),
       totalGoodsCount,
     };
+
     const ts = Date.now();
+    // 严格安全白名单过滤非商品业务字段，严禁客户端透传内部状态字段
     const finalOrderData = {
-      goodsList,
-      ...orderData,
-      orderSummary: computedOrderSummary,
+      goodsList: canonicalGoodsList, // 服务端重建的完全可信商品列表
+      address: orderData.address || null,
       deliveryType: normalizedDeliveryType,
-      _openid: openId, // 确保 openid 正确
+      invoice: orderData.invoice || null,
+      userRemark: orderData.userRemark || "",
+      orderSummary: computedOrderSummary,
+      _openid: openId,
       status: "PENDING_PAYMENT",
       challengeEligible: false,
       challengeStatus: "NONE",

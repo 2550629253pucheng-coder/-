@@ -95,10 +95,64 @@ async function checkChallengeEligibility(order) {
       }
     }
 
+    // 查询绑定的完整规则并生成不可变快照 challengeRuleSnapshot
+    let ruleSnapshot = null;
+    const ruleVersionToFind = activity.ruleVersion;
+    let ruleRes;
+    try {
+      if (ruleVersionToFind) {
+        ruleRes = await db
+          .collection("challenge_rules")
+          .where({ ruleVersion: ruleVersionToFind, status: "ACTIVE" })
+          .limit(1)
+          .get();
+      } else {
+        ruleRes = await db
+          .collection("challenge_rules")
+          .where({ status: "ACTIVE" })
+          .orderBy("effectiveFrom", "desc")
+          .limit(1)
+          .get();
+      }
+    } catch (rErr) {
+      console.warn("[checkChallengeEligibility] query challenge_rules warning:", rErr.message);
+      ruleRes = { data: [] };
+    }
+
+    const dbRule = ruleRes && ruleRes.data && ruleRes.data[0];
+    if (dbRule) {
+      ruleSnapshot = {
+        ruleId: dbRule._id || dbRule.ruleId || "RULE_3S_DEFAULT",
+        ruleVersion: dbRule.ruleVersion || activity.ruleVersion || "TEST_V1",
+        gameType: dbRule.gameType || "THREE_SECOND_STOPWATCH",
+        targetTimeMs: Number(dbRule.targetTimeMs) || 3000,
+        successMinMs: Number(dbRule.successMinMs) || 2980,
+        successMaxMs: Number(dbRule.successMaxMs) || 3020,
+        maxRoundDurationMs: Number(dbRule.maxRoundDurationMs) || 10000,
+        timingToleranceMs: Number(dbRule.timingToleranceMs) || 50,
+        negativeToleranceMs: Number(dbRule.negativeToleranceMs) || 0,
+        maxResumeCount: Number(dbRule.maxResumeCount) || 1,
+      };
+    } else {
+      ruleSnapshot = {
+        ruleId: activity.ruleId || "RULE_3S_DEFAULT",
+        ruleVersion: activity.ruleVersion || "TEST_V1",
+        gameType: "THREE_SECOND_STOPWATCH",
+        targetTimeMs: 3000,
+        successMinMs: 2980,
+        successMaxMs: 3020,
+        maxRoundDurationMs: 10000,
+        timingToleranceMs: 50,
+        negativeToleranceMs: 0,
+        maxResumeCount: 1,
+      };
+    }
+
     return {
       isEligible: true,
       activityId: activity._id || activity.activityId || "ACT_3S_CHALLENGE",
-      ruleVersion: activity.ruleVersion || "TEST_V1",
+      ruleVersion: ruleSnapshot.ruleVersion,
+      challengeRuleSnapshot: ruleSnapshot,
     };
   } catch (err) {
     console.warn(
@@ -316,6 +370,7 @@ exports.main = async (event, context) => {
       challengeEligible: isEligible,
       challengeActivityId: isEligible ? eligibilityResult.activityId : null,
       challengeRuleVersion: isEligible ? eligibilityResult.ruleVersion : null,
+      challengeRuleSnapshot: isEligible ? eligibilityResult.challengeRuleSnapshot : null,
       challengeStatus: isEligible ? "ELIGIBLE" : "NONE",
       challengeRefundStatus: "NONE",
       fulfillmentHold: isEligible ? "CHALLENGE_PENDING" : "NONE",

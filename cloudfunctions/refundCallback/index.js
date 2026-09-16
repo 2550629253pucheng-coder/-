@@ -75,15 +75,23 @@ function parseRefundTime(timeString) {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
-async function getChallengeRefundByRefundNo(outRefundNo) {
-  if (!outRefundNo) return null;
+async function getChallengeRefundByRefundNo(outRefundNo, outTradeNo) {
+  if (!outRefundNo && !outTradeNo) return null;
   try {
-    const res = await db
-      .collection(REFUNDS_COLLECTION)
-      .where({ outRefundNo })
-      .limit(1)
-      .get();
-    return res.data && res.data.length ? res.data[0] : null;
+    if (outRefundNo) {
+      const res = await db
+        .collection(REFUNDS_COLLECTION)
+        .where({ outRefundNo })
+        .limit(1)
+        .get();
+      if (res.data && res.data.length) return res.data[0];
+    }
+    const orderId = outTradeNo || (outRefundNo && outRefundNo.startsWith("CR_") ? outRefundNo.slice(3) : null);
+    if (orderId) {
+      const docRes = await db.collection(REFUNDS_COLLECTION).doc(`CHALLENGE_REFUND_${orderId}`).get().catch(() => null);
+      if (docRes && docRes.data) return docRes.data;
+    }
+    return null;
   } catch (err) {
     console.warn("[getChallengeRefundByRefundNo] Query failed:", err.message);
     return null;
@@ -266,7 +274,7 @@ exports.main = async (event, context) => {
     // ==========================================
     // 支路一：优先查询 Challenge 免单退款 (refunds 集合)
     // ==========================================
-    const challengeRefund = await getChallengeRefundByRefundNo(outRefundNo);
+    const challengeRefund = await getChallengeRefundByRefundNo(outRefundNo, outTradeNo);
     if (challengeRefund && challengeRefund.sourceType === "CHALLENGE_FREE_ORDER") {
       console.log("[refundCallback] Matched CHALLENGE_FREE_ORDER refund:", {
         refundId: challengeRefund._id,

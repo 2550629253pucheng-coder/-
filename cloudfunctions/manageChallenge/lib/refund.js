@@ -4,20 +4,53 @@
  */
 
 /**
- * 构建确定性唯一退款单号，防重复建单
+ * 构建确定性唯一退款单号与文档ID体系，防重复建单与ID漂移
+ * 整个项目统一使用：
+ * refundDocId = CHALLENGE_REFUND_{orderId}
+ * outRefundNo = CR_{orderId}
+ * refundTaskId = REFUND_TASK_{orderId}
  */
-function buildDeterministicRefundKeys(sessionId, orderId) {
+function buildDeterministicRefundKeys(arg1, arg2) {
+  let sessionId;
+  let orderId;
+  if (typeof arg1 === "object" && arg1 !== null) {
+    sessionId = arg1.sessionId;
+    orderId = arg1.orderId;
+  } else {
+    sessionId = arg1;
+    orderId = arg2;
+  }
+
+  if (!orderId) {
+    throw new Error("ORDER_ID_REQUIRED_FOR_REFUND_KEYS");
+  }
+
+  const refundDocId = `CHALLENGE_REFUND_${orderId}`;
   const outRefundNo = `CR_${orderId}`;
-  const refundDocId = `CHALLENGE_REFUND_${sessionId}`;
-  return { outRefundNo, refundDocId };
+  const refundTaskId = `REFUND_TASK_${orderId}`;
+
+  return {
+    refundDocId,
+    outRefundNo,
+    refundTaskId,
+  };
 }
 
 /**
  * 校验并获取订单实际支付金额（分）
+ * LIVE 模式严禁 fallback 至客户端衍生字段，只认 order.paidAmountCents
  */
-function resolvePaidAmountCents(order) {
+function resolvePaidAmountCents(order, isLiveMode = false) {
   if (!order) {
     throw new Error("ORDER_NOT_FOUND");
+  }
+
+  // LIVE 模式严禁从客户端衍生字段 fallback，只认 order.paidAmountCents 权威打点
+  if (isLiveMode) {
+    if (order.paidAmountCents == null || Number(order.paidAmountCents) <= 0) {
+      throw new Error("INVALID_PAID_AMOUNT_SNAPSHOT");
+    }
+    return Number(order.paidAmountCents);
   }
 
   let totalFee = null;
@@ -54,7 +87,7 @@ function buildChallengeRefundDoc({
   isTestMode = false,
   testRefundMode = "AUTO_SUCCESS",
 }) {
-  const { outRefundNo, refundDocId } = buildDeterministicRefundKeys(sessionId, orderId);
+  const { outRefundNo, refundDocId } = buildDeterministicRefundKeys({ sessionId, orderId });
   const now = Date.now();
 
   return {
@@ -65,7 +98,7 @@ function buildChallengeRefundDoc({
     outRefundNo,
     amount: paidCents,
     amountYuan: (paidCents / 100).toFixed(2),
-    status: isTestMode && testRefundMode === "AUTO_SUCCESS" ? "SUCCESS" : "PROCESSING",
+    status: isTestMode && testRefundMode === "AUTO_SUCCESS" ? "SUCCESS" : "PENDING",
     wechatRefundId: isTestMode ? `test_wx_rf_${now}` : null,
     errorCode: null,
     errorMessage: null,
