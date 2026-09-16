@@ -55,10 +55,21 @@ function decryptWxpayResource(resource, apiV3Key) {
 
 /**
  * 校验订单是否命中 3 秒挑战活动资格
- * 规则：activities 表存在 ACTIVE 状态活动，时间在有效范围内，且订单商品或全单命中
+ * 规则：activities 表存在 ACTIVE 状态活动，时间在有效范围内；
+ * 严格防套利规则：Challenge订单必须单商品单件（goodsList.length === 1 && quantity === 1），绝不允许混购！
  */
 async function checkChallengeEligibility(order) {
   try {
+    const goodsList = order.goodsList || [];
+    const totalCount = goodsList.reduce(
+      (sum, item) => sum + Number(item.quantity || 0),
+      0
+    );
+    if (goodsList.length !== 1 || totalCount !== 1) {
+      return { isEligible: false, reason: "NOT_SINGLE_SKU" };
+    }
+
+    const targetGood = goodsList[0];
     const now = Date.now();
     const actRes = await db
       .collection(ACTIVITIES_COLLECTION)
@@ -72,24 +83,29 @@ async function checkChallengeEligibility(order) {
       .get();
 
     if (!actRes.data || actRes.data.length === 0) {
-      return false;
+      return { isEligible: false, reason: "NO_ACTIVE_ACTIVITY" };
     }
 
     const activity = actRes.data[0];
 
-    // 如果活动限制特定 spu/sku，做交叉比对
+    // 如果活动限制特定 spu/sku，做严格比对（严禁 .some 混购套利）
     if (activity.applicableSpuIds && activity.applicableSpuIds.length > 0) {
-      const orderGoods = order.goodsList || [];
-      const hasMatchedGoods = orderGoods.some((g) =>
-        activity.applicableSpuIds.includes(g.spuId)
-      );
-      return hasMatchedGoods;
+      if (!activity.applicableSpuIds.includes(targetGood.spuId)) {
+        return { isEligible: false, reason: "SPU_NOT_IN_ACTIVITY" };
+      }
     }
 
-    return true;
+    return {
+      isEligible: true,
+      activityId: activity._id || activity.activityId || "ACT_3S_CHALLENGE",
+      ruleVersion: activity.ruleVersion || "TEST_V1",
+    };
   } catch (err) {
-    console.warn("[checkChallengeEligibility] Query activities failed, fallback to false:", err);
-    return false;
+    console.warn(
+      "[checkChallengeEligibility] Query activities failed, fallback to false:",
+      err
+    );
+    return { isEligible: false, reason: err.message };
   }
 }
 
@@ -216,40 +232,66 @@ exports.main = async (event, context) => {
       return { errcode: 0, errmsg: "ORDER_ALREADY_ADVANCED" };
     }
 
-    // 3. 严格金额校验：totalFee 与 expectedCents 必须完全一致，防止低付冒充高额订单！
-    const expectedCents = Math.round(Number(order.orderSummary ? order.orderSummary.totalPayAmount : 0) * 100);
-    const actualCents = Number(totalFee);
+    // 3. 严格金额校验：Fail-Closed 原则（一分钱不差，严禁允许 ±1 分容忍度）
+    const expectedCents = Math.round(
+      Number(order.orderSummary ? order.orderSummary.totalPayAmount : 0) * 100
+    );
 
-    if (totalFee != null && !Number.isNaN(actualCents) && expectedCents > 0) {
-      if (Math.abs(actualCents - expectedCents) > 1) {
-        console.error("[paymentCallback] PAYMENT_AMOUNT_MISMATCH! Intercepted:", {
-          orderId: outTradeNo,
-          actualCents,
-          expectedCents,
-        });
-        // 记录支付异常，不修改订单主支付状态
-        await cloud.models.order.update({
-          filter: {
-            where: {
-              $and: [{ _id: { $eq: outTradeNo } }],
-            },
-          },
-          data: {
-            paymentAnomaly: {
-              reason: "AMOUNT_MISMATCH",
-              actualCents,
-              expectedCents,
-              transactionId,
-              time: Date.now(),
-            },
-          },
-        });
-        return { errcode: 1, errmsg: "PAYMENT_AMOUNT_MISMATCH" };
+    if (totalFee == null || totalFee === undefined) {
+      if (isLive) {
+        console.error(
+          "[paymentCallback] PAYMENT_AMOUNT_MISSING in LIVE! Intercepted:",
+          {
+            orderId: outTradeNo,
+          }
+        );
+        return { errcode: 1, errmsg: "PAYMENT_AMOUNT_MISSING" };
       }
     }
 
-    // 4. 活动资质校验 (并非所有商品都自动参与)
-    const isEligible = await checkChallengeEligibility(order);
+    const actualCents = Number(
+      totalFee != null ? totalFee : isLive ? NaN : expectedCents
+    );
+    if (Number.isNaN(actualCents) || actualCents <= 0) {
+      console.error("[paymentCallback] INVALID_PAYMENT_AMOUNT:", {
+        outTradeNo,
+        totalFee,
+      });
+      return { errcode: 1, errmsg: "INVALID_PAYMENT_AMOUNT" };
+    }
+
+    if (actualCents !== expectedCents) {
+      console.error(
+        "[paymentCallback] PAYMENT_AMOUNT_MISMATCH! Intercepted:",
+        {
+          orderId: outTradeNo,
+          actualCents,
+          expectedCents,
+        }
+      );
+      // 记录支付异常，不修改订单主支付状态，拒绝推进订单
+      await cloud.models.order.update({
+        filter: {
+          where: {
+            $and: [{ _id: { $eq: outTradeNo } }],
+          },
+        },
+        data: {
+          paymentAnomaly: {
+            reason: "AMOUNT_MISMATCH",
+            actualCents,
+            expectedCents,
+            transactionId,
+            time: Date.now(),
+          },
+        },
+      });
+      return { errcode: 1, errmsg: "PAYMENT_AMOUNT_MISMATCH" };
+    }
+
+    // 4. 活动资质校验 (严格防混购套利并锁定活动版本)
+    const eligibilityResult = await checkChallengeEligibility(order);
+    const isEligible = Boolean(eligibilityResult && eligibilityResult.isEligible);
 
     const nextStatus = STATUS_PENDING_DELIVERY;
     const now = Date.now();
@@ -257,20 +299,23 @@ exports.main = async (event, context) => {
     console.log("[paymentCallback] updating order to PENDING_DELIVERY:", {
       outTradeNo,
       isEligible,
+      eligibilityResult,
     });
 
     const updateData = {
       status: nextStatus,
       payTime: now,
-      paidAmountCents: actualCents || expectedCents,
+      paidAmountCents: actualCents, // 唯一合法退款基准：必须等于微信支付实收回调
       wechatPayInfo: {
         transactionId,
         timeEnd,
-        totalFee: actualCents || expectedCents,
+        totalFee: actualCents,
         cashFee,
       },
-      // 若命中活动：置入挑战资格与暂扣状态；若未命中：直接 READY，无暂扣
+      // 若命中活动：锁定活动ID、规则版本、置入挑战资格与暂扣状态；若未命中：直接 READY，无暂扣
       challengeEligible: isEligible,
+      challengeActivityId: isEligible ? eligibilityResult.activityId : null,
+      challengeRuleVersion: isEligible ? eligibilityResult.ruleVersion : null,
       challengeStatus: isEligible ? "ELIGIBLE" : "NONE",
       challengeRefundStatus: "NONE",
       fulfillmentHold: isEligible ? "CHALLENGE_PENDING" : "NONE",

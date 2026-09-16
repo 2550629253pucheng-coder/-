@@ -117,6 +117,7 @@ export async function startChallengeSession(orderId) {
  */
 export async function submitChallengeResult({
   sessionId,
+  orderId,
   ticket,
   clientElapsedMs,
   clientStartMonotonic,
@@ -124,7 +125,7 @@ export async function submitChallengeResult({
   deviceInfo,
   networkInfo,
 }) {
-  if (!sessionId || !ticket || typeof clientElapsedMs !== 'number') {
+  if ((!sessionId && !orderId) || !ticket || typeof clientElapsedMs !== 'number') {
     throw new Error('提交参数缺失');
   }
 
@@ -134,6 +135,7 @@ export async function submitChallengeResult({
       action: 'submitChallenge',
       payload: {
         sessionId,
+        orderId,
         ticket,
         clientElapsedMs,
         clientStartMonotonic,

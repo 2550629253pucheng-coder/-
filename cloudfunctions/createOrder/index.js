@@ -61,6 +61,52 @@ exports.main = async (event, context) => {
     };
   }
 
+  // [P0 安全防线] 检查是否混购挑战免单活动商品：
+  // 规则：为防止“1件免单商品+多件高价值普通商品”整单退款套利，挑战活动商品必须独立单件下单！
+  try {
+    const now = Date.now();
+    const activeChallengeRes = await db
+      .collection("activities")
+      .where({
+        type: "THREE_SECOND_CHALLENGE",
+        status: "ACTIVE",
+        startTime: _.lte(now),
+        endTime: _.gte(now),
+      })
+      .limit(1)
+      .get();
+
+    if (activeChallengeRes.data && activeChallengeRes.data.length > 0) {
+      const challengeActivity = activeChallengeRes.data[0];
+      const applicableSpuIds = challengeActivity.applicableSpuIds || [];
+
+      if (applicableSpuIds.length > 0) {
+        const containsChallengeItem = goodsList.some((g) =>
+          applicableSpuIds.includes(g.spuId)
+        );
+
+        if (containsChallengeItem) {
+          const totalCount = goodsList.reduce(
+            (sum, item) => sum + Number(item.quantity || 0),
+            0
+          );
+          if (goodsList.length > 1 || totalCount > 1) {
+            console.warn("[createOrder] Mixed cart challenge arbitrage blocked:", {
+              goodsCount: goodsList.length,
+              totalCount,
+            });
+            return {
+              success: false,
+              message: "参与免单挑战的商品请单独下单，每单限购1件",
+            };
+          }
+        }
+      }
+    }
+  } catch (checkErr) {
+    console.warn("[createOrder] check challenge activity failed, non-blocking:", checkErr);
+  }
+
   const wxContext = cloud.getWXContext();
   const openId = wxContext.OPENID;
   console.log("[createOrder] openId:", openId);

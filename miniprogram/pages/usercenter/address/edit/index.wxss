@@ -1,0 +1,122 @@
+page {
+  background-color: var(--color-page);
+}
+
+page .divider-line {
+  width: 100%;
+  height: 20rpx;
+  background-color: var(--color-page);
+}
+
+/* 微信地址导入按钮 */
+.wx-address-import {
+  background: #fff;
+  padding: 32rpx;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 30rpx;
+  font-weight: 500;
+  color: var(--color-success);
+  /* 微信绿 */
+}
+
+.address-flex-box {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 12rpx 16rpx;
+  /* 行间12rpx, 列12rpx */
+}
+
+.address-detail {
+  font-size: 30rpx;
+}
+
+.address-detail-wx-location {
+  background: #fff;
+  padding: 24rpx 32rpx;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.address-detail-wx-arrow {
+  align-items: flex-end;
+}
+
+.form-cell .t-cell__title {
+  width: 144rpx;
+  padding-right: 32rpx;
+  flex: none !important;
+}
+
+.textarea__wrapper {
+  width: 100%;
+}
+
+.textarea__wrapper .t-textarea {
+  padding: 0 !important;
+}
+
+.form-address .map {
+  font-size: 48rpx !important;
+  margin-left: 20rpx;
+  color: var(--color-text-muted);
+}
+
+.address__tag {
+  justify-content: flex-start !important;
+}
+
+.form-address .label-list {
+  background: var(--color-page);
+  color: var(--color-text);
+  min-width: 100rpx;
+  margin-right: 0;
+  margin-left: 0;
+  /* 间距由 gap 控制 */
+  font-size: 26rpx;
+  border: 2rpx solid transparent;
+  width: auto;
+}
+
+.form-address .label-list::after {
+  content: none;
+}
+
+.form-address .active-btn {
+  color: var(--color-primary);
+  border: 2rpx solid var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+.form-address .active-btn::after {
+  border: 4rpx solid var(--color-warning);
+}
+
+.submit {
+  box-sizing: border-box;
+  padding: 64rpx 30rpx 88rpx 30rpx;
+}
+
+.submit .btn-submit-address {
+  background: var(--color-primary) !important;
+  color: #fff !important;
+}
+
+.dialog__button-confirm {
+  color: var(--color-primary) !important;
+}
+
+.form-address .form-content {
+  --td-input-vertical-padding: 0;
+}
+
+.dialog__input {
+  margin-top: 32rpx;
+  border-radius: 8rpx;
+  box-sizing: border-box;
+  --td-input-vertical-padding: 12px;
+  --td-input-bg-color: var(--color-page-soft);
+}

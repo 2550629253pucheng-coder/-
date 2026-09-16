@@ -175,6 +175,7 @@ Page({
       const envSnap = getEnvironmentSnapshot();
       const submitRes = await submitChallengeResult({
         sessionId: this.data.session.sessionId,
+        orderId: this.data.orderId,
         ticket: this.data.session.ticket,
         clientElapsedMs,
         clientStartMonotonic: this.data.clientStartMonotonic,

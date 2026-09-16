@@ -147,6 +147,9 @@ async function updateOrderGoodsStatus(service, status) {
 exports.main = async (event, context) => {
   console.log("[refundCallback] event:", event);
 
+  const isLive =
+    process.env.NODE_ENV === "production" || process.env.ACTIVITY_MODE === "LIVE";
+
   let eventType;
   let outRefundNo;
   let outTradeNo;
@@ -195,6 +198,12 @@ exports.main = async (event, context) => {
       return { errcode: 1, errmsg: "DECRYPT_FAILED" };
     }
   } else {
+    // 关键安全防线：在 LIVE 生产环境中，只信任微信支付/CloudBase官方安全触发器，严禁伪造外部调用！
+    if (isLive) {
+      console.error("[refundCallback] Untrusted caller in LIVE environment! Blocked.");
+      return { errcode: 1, errmsg: "UNTRUSTED_CALL_SOURCE" };
+    }
+
     ({
       eventType,
       outRefundNo,
@@ -263,20 +272,53 @@ exports.main = async (event, context) => {
         refundId: challengeRefund._id,
         orderId: challengeRefund.orderId,
         outRefundNo,
+        currentStatus: challengeRefund.status,
         finalStatus,
       });
+
+      // 状态防倒退守护：若当前已经是 SUCCESS 终态
+      if (challengeRefund.status === "SUCCESS") {
+        if (finalStatus === RefundStatus.SUCCESS) {
+          console.log("[refundCallback] already SUCCESS, idempotent return");
+          return { errcode: 0, errmsg: "SUCCESS" };
+        } else {
+          // 迟到的失败/异常通知，严禁覆盖已成功的退款终态！
+          console.warn("[refundCallback] Stale failure ignored for SUCCESS refund:", {
+            outRefundNo,
+            finalStatus,
+          });
+          return { errcode: 0, errmsg: "ALREADY_SUCCESS_IGNORE_STALE" };
+        }
+      }
+
+      // 仅当状态处于 PENDING 或 PROCESSING 时才允许推进
+      const isSuccess = finalStatus === RefundStatus.SUCCESS;
+      const targetStatus = isSuccess ? "SUCCESS" : "FAILED";
 
       // 1. 更新 refunds 集合
       await db.collection(REFUNDS_COLLECTION).doc(challengeRefund._id).update({
         data: {
-          status: finalStatus === RefundStatus.SUCCESS ? "SUCCESS" : "FAILED",
+          status: targetStatus,
           wechatRefundId: refundId || challengeRefund.wechatRefundId,
           updatedAt: now,
         },
       });
 
+      // 1.1 更新 refund_tasks 任务状态（如果存在）
+      try {
+        await db.collection("refund_tasks").where({ outRefundNo }).update({
+          data: {
+            status: targetStatus,
+            wechatRefundId: refundId || "",
+            updatedAt: now,
+          },
+        });
+      } catch (taskErr) {
+        console.warn("[refundCallback] update refund_tasks non-blocking:", taskErr);
+      }
+
       // 2. 更新订单状态机与履约暂扣状态
-      if (finalStatus === RefundStatus.SUCCESS) {
+      if (isSuccess) {
         // 退款成功：释放暂扣，允许推送 ERP 进行备货/正常处理
         await db.collection(ORDER_COLLECTION).doc(challengeRefund.orderId).update({
           data: {

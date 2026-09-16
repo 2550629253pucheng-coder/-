@@ -53,7 +53,7 @@
     "disableSWC": true
   },
   "compileType": "miniprogram",
-  "libVersion": "3.13.0",
+  "libVersion": "3.7.7",
   "appid": "",
   "projectname": "retail-oss",
   "simulatorType": "wechat",

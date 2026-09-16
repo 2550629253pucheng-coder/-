@@ -20,6 +20,7 @@ const {
   getHmacSecret,
   createSignedTicket,
   verifyTicket,
+  verifyTicketBinding,
 } = require("./lib/ticket");
 
 const { evaluateTiming } = require("./lib/timing");
@@ -153,27 +154,37 @@ async function handleStartSession(openId, { orderId }) {
     throw new Error("无权操作此订单");
   }
 
-  if (order.status === "PENDING_PAYMENT" || order.status === "CANCELED_NOT_PAYMENT") {
-    throw new Error("订单尚未完成支付，无法发起免单挑战");
+  if (order.status !== "PENDING_DELIVERY") {
+    throw new Error("订单尚未完成支付或状态不合法，无法发起免单挑战");
   }
 
-  if (!order.challengeEligible) {
-    throw new Error("该订单不满足免单挑战参与条件");
-  }
+  // 确定性 Session ID（一单仅一会话，彻底消除 Session 漂移与并发多会话）
+  const sessionId = `CHALLENGE_SESSION_${orderId}`;
 
   // 查询是否已有此订单的挑战会话
-  const sessionRes = await db
-    .collection(CHALLENGE_SESSION_COLLECTION)
-    .where({ orderId, _openid: openId })
-    .limit(1)
-    .get();
+  let existingSession = null;
+  try {
+    const sessionRes = await db
+      .collection(CHALLENGE_SESSION_COLLECTION)
+      .doc(sessionId)
+      .get();
+    existingSession = sessionRes.data;
+  } catch (err) {
+    // 若根据 ID 查不到，兼容按 orderId 兜底查一次
+    const legacyRes = await db
+      .collection(CHALLENGE_SESSION_COLLECTION)
+      .where({ orderId, _openid: openId })
+      .limit(1)
+      .get();
+    if (legacyRes.data && legacyRes.data.length > 0) {
+      existingSession = legacyRes.data[0];
+    }
+  }
 
   const now = Date.now();
 
-  if (sessionRes.data && sessionRes.data.length > 0) {
-    const existingSession = sessionRes.data[0];
-
-    // 如果已经是终态，直接返回结果，绝不重新挑战
+  if (existingSession) {
+    // 1. 如果已经是终态，直接幂等返回结果，绝不重新挑战
     if (
       existingSession.challengeStatus === ChallengeStatus.WIN ||
       existingSession.challengeStatus === ChallengeStatus.LOSE ||
@@ -194,12 +205,35 @@ async function handleStartSession(openId, { orderId }) {
       };
     }
 
-    // 如果会话处于 INTERRUPTED，走恢复逻辑
-    if (existingSession.challengeStatus === ChallengeStatus.INTERRUPTED) {
-      return await handleResumeSession(openId, { sessionId: existingSession._id });
+    // 2. 如果会话正处于 SETTLING 结算锁定中
+    if (existingSession.challengeStatus === ChallengeStatus.SETTLING) {
+      return {
+        success: true,
+        data: {
+          sessionId: existingSession._id,
+          orderId: existingSession.orderId,
+          challengeStatus: ChallengeStatus.SETTLING,
+          challengeCompleted: false,
+          message: "正在结算中，请稍候",
+          ruleSnapshot: existingSession.ruleSnapshot,
+        },
+      };
     }
 
-    // 关键修正：若已经是 IN_PROGRESS，严禁重新签发 Ticket 重置 serverStart！直接返回当前已有时序凭证
+    // 3. 如果会话处于 INTERRUPTED，提示需要先调用 resumeSession
+    if (existingSession.challengeStatus === ChallengeStatus.INTERRUPTED) {
+      return {
+        success: false,
+        message: "挑战会话已中断，请先恢复挑战资格",
+        data: {
+          sessionId: existingSession._id,
+          challengeStatus: ChallengeStatus.INTERRUPTED,
+          requireResume: true,
+        },
+      };
+    }
+
+    // 4. 并发幂等：若已经是 IN_PROGRESS，严禁重新签发 Ticket 重置 serverStart！直接返回当前已有时序凭证
     if (existingSession.challengeStatus === ChallengeStatus.IN_PROGRESS) {
       return {
         success: true,
@@ -215,14 +249,82 @@ async function handleStartSession(openId, { orderId }) {
         },
       };
     }
+
+    // 5. 关键逻辑：若会话处于 READY_TO_RESTART（resume 成功后，用户明确点击“开始挑战”）：
+    if (existingSession.challengeStatus === ChallengeStatus.READY_TO_RESTART) {
+      const ruleSnapshot = existingSession.ruleSnapshot;
+      const serverStartResponseSentAt = now;
+      const nonce = crypto.randomBytes(16).toString("hex");
+
+      const ticket = createSignedTicket({
+        challengeId: existingSession._id,
+        orderId,
+        openid: openId,
+        ruleVersion: ruleSnapshot.ruleVersion,
+        nonce,
+        issuedAt: serverStartResponseSentAt,
+        maxRoundDurationMs: ruleSnapshot.maxRoundDurationMs,
+      });
+
+      await db
+        .collection(CHALLENGE_SESSION_COLLECTION)
+        .doc(existingSession._id)
+        .update({
+          data: {
+            challengeStatus: ChallengeStatus.IN_PROGRESS,
+            serverStartResponseSentAt,
+            latestTicketNonce: nonce,
+            latestTicket: ticket,
+            updatedAt: now,
+          },
+        });
+
+      await db.collection(ORDER_COLLECTION).doc(orderId).update({
+        data: {
+          challengeStatus: ChallengeStatus.IN_PROGRESS,
+          fulfillmentHold: FulfillmentHoldStatus.CHALLENGE_PENDING,
+          erpStatus: ErpStatus.HOLD,
+          updatedAt: now,
+        },
+      });
+
+      return {
+        success: true,
+        data: {
+          sessionId: existingSession._id,
+          orderId,
+          challengeStatus: ChallengeStatus.IN_PROGRESS,
+          challengeCompleted: false,
+          serverStartResponseSentAt,
+          ticket,
+          ruleSnapshot,
+          activityMode: existingSession.activityMode || ACTIVITY_MODE,
+          restarted: true,
+        },
+      };
+    }
   }
 
-  // 全新创建挑战会话并锁定规则版本 (Rule Snapshotting)
+  // 严格资格校验：对于尚未创建 Session 的订单，必须处于 ELIGIBLE 且具备挑战资格
+  if (!order.challengeEligible) {
+    throw new Error("该订单不满足免单挑战参与条件或资格已消费");
+  }
+
+  if (
+    order.challengeStatus === ChallengeStatus.LOSE ||
+    order.challengeStatus === ChallengeStatus.WIN ||
+    order.challengeStatus === ChallengeStatus.EXPIRED
+  ) {
+    throw new Error("该订单挑战已完结，无法再次发起挑战");
+  }
+
+  // 全新创建挑战会话并锁定规则版本 (优先读取支付成功时锁定的 challengeRuleVersion)
+  const lockedRuleVersion = order.challengeRuleVersion;
   const rule = await getEffectiveRule();
   const ruleSnapshot = {
     ruleId: rule.ruleId,
     gameType: rule.gameType,
-    ruleVersion: rule.ruleVersion,
+    ruleVersion: lockedRuleVersion || rule.ruleVersion,
     targetTimeMs: rule.targetTimeMs,
     successMinMs: rule.successMinMs,
     successMaxMs: rule.successMaxMs,
@@ -234,7 +336,6 @@ async function handleStartSession(openId, { orderId }) {
 
   const serverStartResponseSentAt = now;
   const nonce = crypto.randomBytes(16).toString("hex");
-  const sessionId = `cs_${orderId}_${now}`;
 
   const ticket = createSignedTicket({
     challengeId: sessionId,
@@ -263,9 +364,16 @@ async function handleStartSession(openId, { orderId }) {
     updatedAt: now,
   };
 
-  await db.collection(CHALLENGE_SESSION_COLLECTION).add({
-    data: newSessionDoc,
-  });
+  try {
+    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).set({
+      data: newSessionDoc,
+    });
+  } catch (createErr) {
+    console.warn("[handleStartSession] doc set warning, fallback to add:", createErr.message);
+    await db.collection(CHALLENGE_SESSION_COLLECTION).add({
+      data: newSessionDoc,
+    });
+  }
 
   // 更新订单：挑战进行中，独立履约锁置入 CHALLENGE_PENDING
   await db.collection(ORDER_COLLECTION).doc(orderId).update({
@@ -294,11 +402,12 @@ async function handleStartSession(openId, { orderId }) {
 
 /**
  * 2. 提交挑战成绩 (challengeFinish / submitChallenge)
- * 并发安全 CAS，防重入，严密风控审计，退款与履约解耦
+ * 并发安全 CAS 推进至 SETTLING，严格 Ticket-Session 强绑定审计，退款任务异步解耦
  */
 async function handleSubmitChallenge(openId, payload) {
   const {
     sessionId,
+    orderId,
     ticket,
     clientElapsedMs,
     clientStartMonotonic,
@@ -308,14 +417,28 @@ async function handleSubmitChallenge(openId, payload) {
   } = payload || {};
 
   const serverFinishRequestReceivedAt = Date.now();
+  const targetSessionId = sessionId || (orderId ? `CHALLENGE_SESSION_${orderId}` : null);
 
-  if (!sessionId || !ticket || clientElapsedMs == null) {
+  if (!targetSessionId || !ticket || clientElapsedMs == null) {
     throw new Error("SUBMIT_PARAMS_INVALID");
   }
 
   // 1. 查询会话
-  const sessionRes = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).get();
-  const session = sessionRes.data;
+  let session = null;
+  try {
+    const sessionRes = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(targetSessionId).get();
+    session = sessionRes.data;
+  } catch (e) {
+    if (orderId) {
+      const fallbackRes = await db
+        .collection(CHALLENGE_SESSION_COLLECTION)
+        .where({ orderId, _openid: openId })
+        .limit(1)
+        .get();
+      session = fallbackRes.data && fallbackRes.data[0];
+    }
+  }
+
   if (!session || session._openid !== openId) {
     throw new Error("Session not found or permission denied");
   }
@@ -330,7 +453,7 @@ async function handleSubmitChallenge(openId, payload) {
     return {
       success: true,
       data: {
-        sessionId,
+        sessionId: session._id,
         isIdempotent: true,
         challengeStatus: session.challengeStatus,
         isWinner: session.challengeStatus === ChallengeStatus.WIN,
@@ -340,12 +463,60 @@ async function handleSubmitChallenge(openId, payload) {
     };
   }
 
-  // 2. 严格验签 Ticket (使用 crypto.timingSafeEqual 防时序攻击)
+  // 2. 严格验签 Ticket (使用 crypto.timingSafeEqual 防伪)
   if (!verifyTicket(ticket)) {
     throw new Error("TICKET_SIGNATURE_VERIFICATION_FAILED");
   }
 
-  // 3. 计算 Hybrid Timing 差值
+  // 2.1 [P0 核心安全防御] Ticket-Session 强绑定与防旧票/跨会话重放
+  const bindingCheck = verifyTicketBinding(ticket, session, openId);
+  if (!bindingCheck.valid) {
+    console.error("[handleSubmitChallenge] Ticket session binding failed:", bindingCheck.reason);
+    throw new Error(`TICKET_SESSION_BINDING_FAILED: ${bindingCheck.reason}`);
+  }
+
+  // 3. CAS 推进状态到 SETTLING 结算锁定态（防重入与并发）
+  const casUpdateRes = await db
+    .collection(CHALLENGE_SESSION_COLLECTION)
+    .where({
+      _id: session._id,
+      challengeStatus: ChallengeStatus.IN_PROGRESS,
+    })
+    .update({
+      data: {
+        challengeStatus: ChallengeStatus.SETTLING,
+        settlingStartedAt: serverFinishRequestReceivedAt,
+        updatedAt: serverFinishRequestReceivedAt,
+      },
+    });
+
+  // 若 CAS 未匹配到记录，说明有并发请求已抢先推进或正在结算中
+  if (casUpdateRes.stats && casUpdateRes.stats.updated === 0) {
+    const refreshed = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).get();
+    const curStatus = refreshed.data && refreshed.data.challengeStatus;
+    if (curStatus === ChallengeStatus.SETTLING) {
+      return {
+        success: true,
+        data: {
+          sessionId: session._id,
+          challengeStatus: ChallengeStatus.SETTLING,
+          message: "正在结算中，请稍候",
+        },
+      };
+    }
+    return {
+      success: true,
+      data: {
+        sessionId: session._id,
+        isIdempotent: true,
+        challengeStatus: curStatus,
+        isWinner: curStatus === ChallengeStatus.WIN,
+        result: refreshed.data && refreshed.data.result,
+      },
+    };
+  }
+
+  // 4. 计算 Hybrid Timing 差值
   const timingMetrics = evaluateTiming({
     serverStartResponseSentAt: session.serverStartResponseSentAt,
     serverFinishRequestReceivedAt,
@@ -353,7 +524,7 @@ async function handleSubmitChallenge(openId, payload) {
     ruleSnapshot: session.ruleSnapshot,
   });
 
-  // 4. 风控与异常审计评估
+  // 5. 风控与异常审计评估
   const riskAssessment = assessRisk({
     timingMetrics,
     ruleSnapshot: session.ruleSnapshot,
@@ -361,9 +532,9 @@ async function handleSubmitChallenge(openId, payload) {
     maxResumeCount: session.ruleSnapshot.maxResumeCount || 1,
   });
 
-  // 5. 结算裁决 (通过状态机白名单断言)
+  // 6. 结算裁决 (从 SETTLING 状态安全流转到终态)
   const settlement = resolveSettlement({
-    currentStatus: session.challengeStatus,
+    currentStatus: ChallengeStatus.SETTLING,
     timingMetrics,
     riskAssessment,
     ruleSnapshot: session.ruleSnapshot,
@@ -371,43 +542,23 @@ async function handleSubmitChallenge(openId, payload) {
 
   const now = Date.now();
 
-  // 6. CAS 条件更新：仅当 challengeStatus == session.challengeStatus (IN_PROGRESS) 时才允许推进
-  const casUpdateRes = await db
-    .collection(CHALLENGE_SESSION_COLLECTION)
-    .where({
-      _id: sessionId,
-      challengeStatus: session.challengeStatus,
-    })
-    .update({
-      data: {
-        challengeStatus: settlement.challengeStatus,
-        result: settlement.result,
-        deviceInfo: deviceInfo || null,
-        networkInfo: networkInfo || null,
-        settledTime: now,
-        updatedAt: now,
-      },
-    });
+  // 7. 更新 Session 至终态
+  await db.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).update({
+    data: {
+      challengeStatus: settlement.challengeStatus,
+      result: settlement.result,
+      deviceInfo: deviceInfo || null,
+      networkInfo: networkInfo || null,
+      settledTime: now,
+      updatedAt: now,
+    },
+  });
 
-  // 若 CAS 未匹配到记录，说明有并发请求已抢先完成结算
-  if (casUpdateRes.stats && casUpdateRes.stats.updated === 0) {
-    const refreshed = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).get();
-    return {
-      success: true,
-      data: {
-        sessionId,
-        isIdempotent: true,
-        challengeStatus: refreshed.data.challengeStatus,
-        isWinner: refreshed.data.challengeStatus === ChallengeStatus.WIN,
-        result: refreshed.data.result,
-      },
-    };
-  }
-
-  // 7. 同步更新订单状态与履约暂扣标记
+  // 8. 同步更新订单状态机与履约暂扣标记（永久消费资格 challengeEligible: false）
   await db.collection(ORDER_COLLECTION).doc(session.orderId).update({
     data: {
       challengeStatus: settlement.challengeStatus,
+      challengeEligible: false, // [P0] 终态永久消费资格
       challengeRefundStatus: settlement.challengeRefundStatus,
       fulfillmentHold: settlement.fulfillmentHold,
       erpStatus: settlement.erpStatus,
@@ -415,10 +566,10 @@ async function handleSubmitChallenge(openId, payload) {
     },
   });
 
-  // 8. 若获胜 WIN，触发退款链路
+  // 9. 若获胜 WIN，触发退款任务队列
   let refundInfo = null;
   if (settlement.challengeStatus === ChallengeStatus.WIN) {
-    refundInfo = await executeChallengeRefund({
+    refundInfo = await createAndQueueChallengeRefund({
       session,
       result: settlement.result,
     });
@@ -427,7 +578,7 @@ async function handleSubmitChallenge(openId, payload) {
   return {
     success: true,
     data: {
-      sessionId,
+      sessionId: session._id,
       challengeStatus: settlement.challengeStatus,
       isWinner: settlement.isWinner,
       result: settlement.result,
@@ -437,19 +588,24 @@ async function handleSubmitChallenge(openId, payload) {
 }
 
 /**
- * 3. 执行挑战免单退款 (写入 refunds 集合并流转)
+ * 3. 创建挑战免单退款并排队任务 (refund_tasks 模式)
  */
-async function executeChallengeRefund({ session, result }) {
+async function createAndQueueChallengeRefund({ session, result }) {
   const orderId = session.orderId;
   const orderRes = await db.collection(ORDER_COLLECTION).doc(orderId).get();
   const order = orderRes.data;
   if (!order) return null;
 
-  // 确定金额 (服务端校验实际已支付金额，绝不信客户端)
+  // 严格确定金额 (服务端校验实际已支付金额，绝不信客户端)
   const paidCents = resolvePaidAmountCents(order);
   const isTestMode = session.activityMode === "TEST" || ACTIVITY_MODE === "TEST";
 
   // 构建确定性退款单据 (CR_{orderId})
+  const { outRefundNo, refundIdempotencyKey } = buildDeterministicRefundKeys({
+    orderId,
+    challengeId: session._id,
+  });
+
   const refundDoc = buildChallengeRefundDoc({
     sessionId: session._id,
     orderId,
@@ -458,81 +614,170 @@ async function executeChallengeRefund({ session, result }) {
     testRefundMode: TEST_REFUND_MODE,
   });
 
+  // 1. 幂等插入 refunds 集合
   try {
-    await db.collection(REFUNDS_COLLECTION).add({
+    await db.collection(REFUNDS_COLLECTION).doc(refundDoc._id).set({
       data: refundDoc,
     });
   } catch (err) {
-    console.warn("[executeChallengeRefund] Refund doc might already exist:", err.message);
+    console.warn("[createAndQueueChallengeRefund] Refund doc might already exist:", err.message);
   }
 
-  // 如果在 TEST 模式且配置为 AUTO_SUCCESS，直接安全模拟退款成功并解除履约暂扣
-  if (isTestMode && TEST_REFUND_MODE === "AUTO_SUCCESS") {
-    const now = Date.now();
-    await db.collection(REFUNDS_COLLECTION).doc(refundDoc._id).update({
-      data: {
-        status: "SUCCESS",
-        updatedAt: now,
-      },
+  // 2. 写入 refund_tasks 任务表
+  const taskId = `TASK_${outRefundNo}`;
+  const now = Date.now();
+  const taskDoc = {
+    _id: taskId,
+    orderId,
+    sessionId: session._id,
+    outRefundNo,
+    amountCents: paidCents,
+    status: "PENDING",
+    retryCount: 0,
+    maxRetries: 5,
+    lastError: null,
+    nextRetryAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  try {
+    await db.collection("refund_tasks").doc(taskId).set({
+      data: taskDoc,
     });
-
-    await db.collection(ORDER_COLLECTION).doc(orderId).update({
-      data: {
-        challengeRefundStatus: ChallengeRefundStatus.SUCCESS,
-        fulfillmentHold: FulfillmentHoldStatus.NONE, // 退款成功才允许释放暂扣！
-        erpStatus: ErpStatus.READY,
-        challengeRefundInfo: {
-          refundId: refundDoc._id,
-          outRefundNo: refundDoc.outRefundNo,
-          amountYuan: refundDoc.amountYuan,
-          successTime: now,
-        },
-        updatedAt: now,
-      },
-    });
-
-    return {
-      refundId: refundDoc._id,
-      outRefundNo: refundDoc.outRefundNo,
-      amountYuan: refundDoc.amountYuan,
-      status: "SUCCESS",
-    };
+  } catch (taskErr) {
+    console.warn("[createAndQueueChallengeRefund] refund_task set warning:", taskErr.message);
   }
 
-  // LIVE 模式或 MANUAL/FAILURE 模式：真实发起微信支付退款，状态保持 PROCESSING，发货坚决锁定
-  if (!isTestMode) {
-    try {
-      if (cloud.cloudPay && typeof cloud.cloudPay.refund === "function") {
-        await cloud.cloudPay.refund({
-          out_trade_no: orderId,
-          out_refund_no: refundDoc.outRefundNo,
-          total_fee: paidCents,
-          refund_fee: paidCents,
-          refund_desc: "3秒挑战免单全额返款",
-        });
-      }
-    } catch (wxErr) {
-      console.error("[executeChallengeRefund] cloud.cloudPay.refund failed:", wxErr);
-    }
-  }
+  // 3. 触发退款任务派发
+  const dispatchResult = await dispatchRefundTask(taskDoc, session, order);
 
   return {
     refundId: refundDoc._id,
-    outRefundNo: refundDoc.outRefundNo,
+    outRefundNo,
+    amountCents: paidCents,
     amountYuan: refundDoc.amountYuan,
-    status: "PROCESSING",
+    status: dispatchResult.status,
   };
 }
 
 /**
- * 4. 恢复会话 (challengeResume)
- * 限制恢复次数，防范作弊，防范无限刷新
+ * 3.1 派发并处理退款任务
  */
-async function handleResumeSession(openId, { sessionId }) {
-  if (!sessionId) throw new Error("SessionId required");
+async function dispatchRefundTask(taskDoc, session, order) {
+  const isTestMode = session.activityMode === "TEST" || ACTIVITY_MODE === "TEST";
+  const now = Date.now();
 
-  const sessionRes = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).get();
-  const session = sessionRes.data;
+  // TEST 模式：根据配置模拟
+  if (isTestMode) {
+    if (TEST_REFUND_MODE === "AUTO_SUCCESS") {
+      await db.collection(REFUNDS_COLLECTION).doc(taskDoc.outRefundNo ? `CR_${taskDoc.orderId}` : "").update({
+        data: {
+          status: "SUCCESS",
+          updatedAt: now,
+        },
+      });
+
+      await db.collection("refund_tasks").doc(taskDoc._id).update({
+        data: {
+          status: "SUCCESS",
+          updatedAt: now,
+        },
+      });
+
+      await db.collection(ORDER_COLLECTION).doc(taskDoc.orderId).update({
+        data: {
+          challengeRefundStatus: ChallengeRefundStatus.SUCCESS,
+          fulfillmentHold: FulfillmentHoldStatus.NONE, // 退款成功才允许释放暂扣！
+          erpStatus: ErpStatus.READY,
+          challengeRefundInfo: {
+            refundId: `CR_${taskDoc.orderId}`,
+            outRefundNo: taskDoc.outRefundNo,
+            amountCents: taskDoc.amountCents,
+            successTime: now,
+          },
+          updatedAt: now,
+        },
+      });
+
+      return { status: "SUCCESS" };
+    } else if (TEST_REFUND_MODE === "FAILURE") {
+      await db.collection(REFUNDS_COLLECTION).doc(`CR_${taskDoc.orderId}`).update({
+        data: {
+          status: "FAILED",
+          updatedAt: now,
+        },
+      });
+      await db.collection("refund_tasks").doc(taskDoc._id).update({
+        data: {
+          status: "FAILED",
+          lastError: "SIMULATED_TEST_FAILURE",
+          updatedAt: now,
+        },
+      });
+      return { status: "FAILED" };
+    }
+
+    return { status: "PENDING" };
+  }
+
+  // LIVE 模式：真实发起微信支付退款，状态保持 PROCESSING，发货坚决锁定
+  try {
+    if (cloud.cloudPay && typeof cloud.cloudPay.refund === "function") {
+      await cloud.cloudPay.refund({
+        out_trade_no: taskDoc.orderId,
+        out_refund_no: taskDoc.outRefundNo,
+        total_fee: taskDoc.amountCents,
+        refund_fee: taskDoc.amountCents,
+        refund_desc: "3秒挑战免单全额返款",
+      });
+      await db.collection("refund_tasks").doc(taskDoc._id).update({
+        data: {
+          status: "PROCESSING",
+          updatedAt: now,
+        },
+      });
+      return { status: "PROCESSING" };
+    }
+  } catch (wxErr) {
+    console.error("[dispatchRefundTask] cloud.cloudPay.refund failed:", wxErr);
+    await db.collection("refund_tasks").doc(taskDoc._id).update({
+      data: {
+        status: "RETRY",
+        retryCount: (taskDoc.retryCount || 0) + 1,
+        lastError: wxErr.message,
+        nextRetryAt: now + 30000,
+        updatedAt: now,
+      },
+    });
+  }
+
+  return { status: "PROCESSING" };
+}
+
+/**
+ * 4. 恢复会话资格 (challengeResume)
+ * [P0 核心解耦]：Resume 只恢复资格，绝不签发 timing ticket，绝不设置 serverStartResponseSentAt！
+ */
+async function handleResumeSession(openId, { sessionId, orderId }) {
+  const targetSessionId = sessionId || (orderId ? `CHALLENGE_SESSION_${orderId}` : null);
+  if (!targetSessionId) throw new Error("SessionId or orderId required");
+
+  let session = null;
+  try {
+    const sessionRes = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(targetSessionId).get();
+    session = sessionRes.data;
+  } catch (e) {
+    if (orderId) {
+      const fallbackRes = await db
+        .collection(CHALLENGE_SESSION_COLLECTION)
+        .where({ orderId, _openid: openId })
+        .limit(1)
+        .get();
+      session = fallbackRes.data && fallbackRes.data[0];
+    }
+  }
+
   if (!session || session._openid !== openId) {
     throw new Error("Session not found or permission denied");
   }
@@ -547,10 +792,25 @@ async function handleResumeSession(openId, { sessionId }) {
     return {
       success: true,
       data: {
-        sessionId,
+        sessionId: session._id,
         challengeStatus: session.challengeStatus,
         challengeCompleted: true,
         result: session.result,
+        ruleSnapshot: session.ruleSnapshot,
+      },
+    };
+  }
+
+  // 若已经是 READY_TO_RESTART，幂等返回
+  if (session.challengeStatus === ChallengeStatus.READY_TO_RESTART) {
+    return {
+      success: true,
+      data: {
+        sessionId: session._id,
+        orderId: session.orderId,
+        challengeStatus: ChallengeStatus.READY_TO_RESTART,
+        readyToStart: true,
+        resumeCount: session.resumeCount || 0,
         ruleSnapshot: session.ruleSnapshot,
       },
     };
@@ -563,7 +823,7 @@ async function handleResumeSession(openId, { sessionId }) {
   // 校验恢复次数限制：超过上限直接转为 PENDING_REVIEW 风控挂起
   if (currentResumeCount >= maxResumeCount) {
     const now = Date.now();
-    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).update({
+    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).update({
       data: {
         challengeStatus: ChallengeStatus.PENDING_REVIEW,
         reviewReason: "EXCEEDED_MAX_RESUME_COUNT",
@@ -584,33 +844,21 @@ async function handleResumeSession(openId, { sessionId }) {
       success: false,
       message: "中断恢复次数超出限制，已移交风控审核",
       data: {
-        sessionId,
+        sessionId: session._id,
         challengeStatus: ChallengeStatus.PENDING_REVIEW,
       },
     };
   }
 
-  // 正常恢复：生成新 Nonce 与 Ticket，重新打点 serverStartResponseSentAt
+  // [P0 核心解耦]：Resume 只恢复资格，绝不签发 timing ticket，绝不打点时序！
+  // 必须立即使旧 ticket 与 nonce 彻底作废！
   const now = Date.now();
-  const nonce = crypto.randomBytes(16).toString("hex");
-  const serverStartResponseSentAt = now;
-
-  const ticket = createSignedTicket({
-    challengeId: sessionId,
-    orderId: session.orderId,
-    openid: openId,
-    ruleVersion: ruleSnapshot.ruleVersion,
-    nonce,
-    issuedAt: serverStartResponseSentAt,
-    maxRoundDurationMs: ruleSnapshot.maxRoundDurationMs,
-  });
-
-  await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).update({
+  await db.collection(CHALLENGE_SESSION_COLLECTION).doc(session._id).update({
     data: {
-      challengeStatus: ChallengeStatus.IN_PROGRESS,
-      serverStartResponseSentAt,
-      latestTicketNonce: nonce,
-      latestTicket: ticket,
+      challengeStatus: ChallengeStatus.READY_TO_RESTART,
+      serverStartResponseSentAt: null, // 清空起始时序打点
+      latestTicketNonce: null,         // 作废旧 Nonce
+      latestTicket: null,              // 作废旧 Ticket
       resumeCount: currentResumeCount + 1,
       resumedAt: now,
       updatedAt: now,
@@ -619,8 +867,9 @@ async function handleResumeSession(openId, { sessionId }) {
 
   await db.collection(ORDER_COLLECTION).doc(session.orderId).update({
     data: {
-      challengeStatus: ChallengeStatus.IN_PROGRESS,
+      challengeStatus: ChallengeStatus.READY_TO_RESTART,
       fulfillmentHold: FulfillmentHoldStatus.CHALLENGE_PENDING,
+      erpStatus: ErpStatus.HOLD,
       updatedAt: now,
     },
   });
@@ -628,16 +877,12 @@ async function handleResumeSession(openId, { sessionId }) {
   return {
     success: true,
     data: {
-      sessionId,
+      sessionId: session._id,
       orderId: session.orderId,
-      challengeStatus: ChallengeStatus.IN_PROGRESS,
-      challengeCompleted: false,
-      serverStartResponseSentAt,
-      ticket,
-      ruleSnapshot,
-      activityMode: session.activityMode || ACTIVITY_MODE,
-      resumed: true,
+      challengeStatus: ChallengeStatus.READY_TO_RESTART,
+      readyToStart: true,
       resumeCount: currentResumeCount + 1,
+      ruleSnapshot: session.ruleSnapshot,
     },
   };
 }
@@ -692,8 +937,7 @@ async function handleRecordInterrupted(openId, { sessionId, reason }) {
 
 /**
  * 6. 用户主动放弃/跳过挑战 (skipChallenge)
- * 关键安全修复：绝不允许在 IN_PROGRESS, WIN, REFUND_PENDING, SAFE_SETTLEMENT 下绕过发货锁定！
- * 仅允许在 challengeStatus == ELIGIBLE (未开始) 时 Skip
+ * [P0 安全原则]：跳过必须永久消费资格，绝不允许在 REFUND_PENDING, SAFE_SETTLEMENT 下跳过！
  */
 async function handleSkipChallenge(openId, { orderId }) {
   if (!orderId) throw new Error("OrderId required");
@@ -704,8 +948,12 @@ async function handleSkipChallenge(openId, { orderId }) {
     throw new Error("Order not found or permission denied");
   }
 
-  // 安全检查：只有 ELIGIBLE 允许跳过！
-  if (order.challengeStatus && order.challengeStatus !== ChallengeStatus.ELIGIBLE) {
+  // 安全检查：只有 ELIGIBLE 或 READY_TO_RESTART 允许跳过！
+  if (
+    order.challengeStatus &&
+    order.challengeStatus !== ChallengeStatus.ELIGIBLE &&
+    order.challengeStatus !== ChallengeStatus.READY_TO_RESTART
+  ) {
     throw new Error(`CANNOT_SKIP_IN_STATUS: ${order.challengeStatus}`);
   }
 
@@ -718,21 +966,21 @@ async function handleSkipChallenge(openId, { orderId }) {
 
   const now = Date.now();
 
-  // 条件原子更新：确保订单未被其他操作修改
+  // 条件原子更新：确保订单未被其他操作修改，且永久消费资格
   const updateRes = await db
     .collection(ORDER_COLLECTION)
     .where({
       _id: orderId,
       _openid: openId,
-      challengeStatus: ChallengeStatus.ELIGIBLE,
     })
     .update({
       data: {
+        challengeEligible: false, // [P0] 永久消费资格，严禁二次发起
         challengeStatus: ChallengeStatus.LOSE,
         challengeRefundStatus: ChallengeRefundStatus.NONE,
         settlementReason: "USER_SKIPPED",
-        fulfillmentHold: FulfillmentHoldStatus.NONE,
-        erpStatus: ErpStatus.READY,
+        fulfillmentHold: FulfillmentHoldStatus.NONE, // 释放履约暂扣，进入正常备货
+        erpStatus: ErpStatus.READY,                  // 允许进入 ERP
         updatedAt: now,
       },
     });
@@ -741,7 +989,62 @@ async function handleSkipChallenge(openId, { orderId }) {
     throw new Error("SKIP_FAILED_STATE_CONFLICT");
   }
 
+  // 同步如果已有 Session，Session 也置为 LOSE 终态
+  const sessionId = `CHALLENGE_SESSION_${orderId}`;
+  try {
+    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(sessionId).update({
+      data: {
+        challengeStatus: ChallengeStatus.LOSE,
+        settlementReason: "USER_SKIPPED",
+        updatedAt: now,
+      },
+    });
+  } catch (sessErr) {
+    // Session 尚未创建时安全忽略
+  }
+
   return { success: true };
+}
+
+/**
+ * 6.1 容灾恢复卡死在 SETTLING 的会话 (recoverSettlingSession)
+ */
+async function handleRecoverSettlingSession(openId, { sessionId, orderId }) {
+  const targetSessionId = sessionId || (orderId ? `CHALLENGE_SESSION_${orderId}` : null);
+  if (!targetSessionId) throw new Error("SessionId or orderId required");
+
+  const sessionRes = await db.collection(CHALLENGE_SESSION_COLLECTION).doc(targetSessionId).get();
+  const session = sessionRes.data;
+  if (!session) throw new Error("Session not found");
+
+  // 如果会话在 SETTLING 超过 10 秒
+  const now = Date.now();
+  if (
+    session.challengeStatus === ChallengeStatus.SETTLING &&
+    now - (session.settlingStartedAt || 0) > 10000
+  ) {
+    console.warn("[handleRecoverSettlingSession] Recovering stuck settling session:", targetSessionId);
+    // 自动移交人工或风控审核，绝不陷入死锁
+    await db.collection(CHALLENGE_SESSION_COLLECTION).doc(targetSessionId).update({
+      data: {
+        challengeStatus: ChallengeStatus.PENDING_REVIEW,
+        reviewReason: "SETTLING_TIMEOUT_RECOVERED",
+        updatedAt: now,
+      },
+    });
+    await db.collection(ORDER_COLLECTION).doc(session.orderId).update({
+      data: {
+        challengeStatus: ChallengeStatus.PENDING_REVIEW,
+        challengeEligible: false,
+        fulfillmentHold: FulfillmentHoldStatus.SAFE_SETTLEMENT,
+        erpStatus: ErpStatus.HOLD,
+        updatedAt: now,
+      },
+    });
+    return { success: true, recovered: true, status: ChallengeStatus.PENDING_REVIEW };
+  }
+
+  return { success: true, recovered: false, status: session.challengeStatus };
 }
 
 /**
@@ -804,6 +1107,9 @@ exports.main = async (event, context) => {
       case "skipChallenge":
       case "settleHold":
         return await handleSkipChallenge(openId, payload);
+
+      case "recoverSettlingSession":
+        return await handleRecoverSettlingSession(openId, payload);
 
       case "getSession":
         return await handleGetSession(openId, payload);
