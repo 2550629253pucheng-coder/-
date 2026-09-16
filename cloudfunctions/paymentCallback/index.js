@@ -6,14 +6,15 @@ cloud.init({
   env: cloud.DYNAMIC_CURRENT_ENV,
 });
 
-// 初始化数据模型 SDK
-// 这会挂载 models 到 cloud 对象上，使得我们可以使用 cloud.models.order
 init(cloud);
 
-// 对应 OrderStatus.PENDING_DELIVERY (待发货)
+const db = cloud.database();
+const _ = db.command;
+
+const STATUS_PENDING_PAYMENT = "PENDING_PAYMENT";
 const STATUS_PENDING_DELIVERY = "PENDING_DELIVERY";
-// 对应 OrderStatus.PENDING_RECEIPT (待收货)
-const STATUS_PENDING_RECEIPT = "PENDING_RECEIPT";
+
+const ACTIVITIES_COLLECTION = "activities";
 
 function normalizeWxpayResource(resource) {
   if (!resource) return null;
@@ -21,7 +22,6 @@ function normalizeWxpayResource(resource) {
     try {
       return JSON.parse(resource);
     } catch (err) {
-      // If it's a plain ciphertext string, return as-is to trigger validation error.
       return { ciphertext: resource };
     }
   }
@@ -53,8 +53,50 @@ function decryptWxpayResource(resource, apiV3Key) {
   return plaintext.toString("utf8");
 }
 
+/**
+ * 校验订单是否命中 3 秒挑战活动资格
+ * 规则：activities 表存在 ACTIVE 状态活动，时间在有效范围内，且订单商品或全单命中
+ */
+async function checkChallengeEligibility(order) {
+  try {
+    const now = Date.now();
+    const actRes = await db
+      .collection(ACTIVITIES_COLLECTION)
+      .where({
+        type: "THREE_SECOND_CHALLENGE",
+        status: "ACTIVE",
+        startTime: _.lte(now),
+        endTime: _.gte(now),
+      })
+      .limit(1)
+      .get();
+
+    if (!actRes.data || actRes.data.length === 0) {
+      return false;
+    }
+
+    const activity = actRes.data[0];
+
+    // 如果活动限制特定 spu/sku，做交叉比对
+    if (activity.applicableSpuIds && activity.applicableSpuIds.length > 0) {
+      const orderGoods = order.goodsList || [];
+      const hasMatchedGoods = orderGoods.some((g) =>
+        activity.applicableSpuIds.includes(g.spuId)
+      );
+      return hasMatchedGoods;
+    }
+
+    return true;
+  } catch (err) {
+    console.warn("[checkChallengeEligibility] Query activities failed, fallback to false:", err);
+    return false;
+  }
+}
+
 exports.main = async (event, context) => {
   console.log("[paymentCallback] event:", event);
+
+  const isLive = process.env.NODE_ENV === "production" || process.env.ACTIVITY_MODE === "LIVE";
 
   let returnCode;
   let resultCode;
@@ -63,8 +105,9 @@ exports.main = async (event, context) => {
   let timeEnd;
   let totalFee;
   let cashFee;
+  let isTriggerFromWxpay = false;
 
-  // 工作流 wxpayTrigger 回调：从 input.data 中获取 resource 解密
+  // 1. 微信支付触发器回调解析
   if (
     event &&
     event.wxpayTrigger &&
@@ -72,6 +115,7 @@ exports.main = async (event, context) => {
     event.wxpayTrigger.input.data
   ) {
     try {
+      isTriggerFromWxpay = true;
       const input = event.wxpayTrigger.input || {};
       const payload = JSON.parse(input.data);
       const plaintext = decryptWxpayResource(
@@ -97,13 +141,19 @@ exports.main = async (event, context) => {
         timeEnd,
         totalFee,
         cashFee,
-        eventType: payload ? payload.event_type : undefined,
       });
     } catch (err) {
       console.error("[paymentCallback] decrypt wxpay resource failed:", err);
       return { errcode: 1, errmsg: "DECRYPT_FAILED" };
     }
   } else {
+    // 关键安全防线：在 LIVE 生产环境中，只信任官方安全触发器，严禁外部普通调用伪造支付！
+    if (isLive) {
+      console.error("[paymentCallback] Untrusted caller in LIVE environment! Blocked.");
+      return { errcode: 1, errmsg: "UNTRUSTED_CALL_SOURCE" };
+    }
+
+    // 仅在非 LIVE / TEST 环境下允许模拟调用
     ({
       returnCode,
       resultCode,
@@ -112,7 +162,7 @@ exports.main = async (event, context) => {
       timeEnd,
       totalFee,
       cashFee,
-    } = event);
+    } = event || {});
   }
 
   if (returnCode !== "SUCCESS" || resultCode !== "SUCCESS") {
@@ -120,7 +170,6 @@ exports.main = async (event, context) => {
       returnCode,
       resultCode,
       outTradeNo,
-      transactionId,
     });
     return { errcode: 0, errmsg: "IGNORE_FAILURE" };
   }
@@ -132,8 +181,7 @@ exports.main = async (event, context) => {
 
   try {
     console.log("[paymentCallback] fetching order:", outTradeNo);
-    // 1. 使用 cloud.models 查询订单
-    // 参考 orderConfirm.js 的查询风格 (使用 filter 和 where)
+    // 1. 查询订单
     const orderRes = await cloud.models.order.get({
       filter: {
         where: {
@@ -149,36 +197,84 @@ exports.main = async (event, context) => {
     const order = orderRes.data;
 
     if (!order) {
-      console.error("[paymentCallback] order not found:", outTradeNo, orderRes);
-      // 如果查询不到订单，可能是延迟或异常，返回错误让微信重试
+      console.error("[paymentCallback] order not found:", outTradeNo);
       return { errcode: 1, errmsg: "ORDER_NOT_FOUND" };
     }
 
-    const nextStatus = STATUS_PENDING_DELIVERY;
-
-    if (order.status === nextStatus) {
-      console.log("[paymentCallback] already processed:", outTradeNo);
-      return { errcode: 0, errmsg: "SUCCESS" };
+    // 2. 状态单向扭转守护：只允许 PENDING_PAYMENT -> PENDING_DELIVERY
+    if (order.status !== STATUS_PENDING_PAYMENT) {
+      // 若已经是 PENDING_DELIVERY，幂等返回成功
+      if (order.status === STATUS_PENDING_DELIVERY) {
+        console.log("[paymentCallback] already processed PENDING_DELIVERY:", outTradeNo);
+        return { errcode: 0, errmsg: "SUCCESS" };
+      }
+      // 若已经处于 PENDING_RECEIPT 或 COMPLETE 等后续流程，绝不逆流倒退！
+      console.warn("[paymentCallback] Order is already advanced, state backward rejected:", {
+        orderId: outTradeNo,
+        currentStatus: order.status,
+      });
+      return { errcode: 0, errmsg: "ORDER_ALREADY_ADVANCED" };
     }
 
-    // 2. 使用 cloud.models 更新订单
-    // 注意：微搭数据模型 API 通常接收 JSON 数据，时间类型建议使用时间戳
-    console.log("[paymentCallback] updating order:", outTradeNo);
+    // 3. 严格金额校验：totalFee 与 expectedCents 必须完全一致，防止低付冒充高额订单！
+    const expectedCents = Math.round(Number(order.orderSummary ? order.orderSummary.totalPayAmount : 0) * 100);
+    const actualCents = Number(totalFee);
+
+    if (totalFee != null && !Number.isNaN(actualCents) && expectedCents > 0) {
+      if (Math.abs(actualCents - expectedCents) > 1) {
+        console.error("[paymentCallback] PAYMENT_AMOUNT_MISMATCH! Intercepted:", {
+          orderId: outTradeNo,
+          actualCents,
+          expectedCents,
+        });
+        // 记录支付异常，不修改订单主支付状态
+        await cloud.models.order.update({
+          filter: {
+            where: {
+              $and: [{ _id: { $eq: outTradeNo } }],
+            },
+          },
+          data: {
+            paymentAnomaly: {
+              reason: "AMOUNT_MISMATCH",
+              actualCents,
+              expectedCents,
+              transactionId,
+              time: Date.now(),
+            },
+          },
+        });
+        return { errcode: 1, errmsg: "PAYMENT_AMOUNT_MISMATCH" };
+      }
+    }
+
+    // 4. 活动资质校验 (并非所有商品都自动参与)
+    const isEligible = await checkChallengeEligibility(order);
+
+    const nextStatus = STATUS_PENDING_DELIVERY;
+    const now = Date.now();
+
+    console.log("[paymentCallback] updating order to PENDING_DELIVERY:", {
+      outTradeNo,
+      isEligible,
+    });
+
     const updateData = {
       status: nextStatus,
-      payTime: Date.now(), // 使用时间戳代替 db.serverDate()
+      payTime: now,
+      paidAmountCents: actualCents || expectedCents,
       wechatPayInfo: {
         transactionId,
         timeEnd,
-        totalFee,
+        totalFee: actualCents || expectedCents,
         cashFee,
       },
-      // 开启3秒挑战资质，置入履约暂扣枚举状态与独立状态机
-      challengeEligible: true,
-      challengeStatus: "ELIGIBLE",
+      // 若命中活动：置入挑战资格与暂扣状态；若未命中：直接 READY，无暂扣
+      challengeEligible: isEligible,
+      challengeStatus: isEligible ? "ELIGIBLE" : "NONE",
       challengeRefundStatus: "NONE",
-      fulfillmentHold: "CHALLENGE_PENDING",
-      erpStatus: "HOLD",
+      fulfillmentHold: isEligible ? "CHALLENGE_PENDING" : "NONE",
+      erpStatus: isEligible ? "HOLD" : "READY",
     };
 
     const updateRes = await cloud.models.order.update({
@@ -188,6 +284,9 @@ exports.main = async (event, context) => {
             {
               _id: { $eq: outTradeNo },
             },
+            {
+              status: { $eq: STATUS_PENDING_PAYMENT }, // CAS 单向更新
+            },
           ],
         },
       },
@@ -195,7 +294,6 @@ exports.main = async (event, context) => {
     });
 
     console.log("[paymentCallback] order update success:", updateRes);
-
     return { errcode: 0, errmsg: "SUCCESS" };
   } catch (err) {
     console.error("[paymentCallback] handler error:", err);

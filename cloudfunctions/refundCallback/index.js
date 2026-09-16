@@ -13,6 +13,7 @@ const _ = db.command;
 
 const AFTER_SERVICE_COLLECTION = "after-service";
 const ORDER_COLLECTION = "order";
+const REFUNDS_COLLECTION = "refunds";
 
 const AfterServiceStatus = {
   TO_AUDIT: 10,
@@ -72,6 +73,21 @@ function parseRefundTime(timeString) {
   if (!timeString) return 0;
   const ms = Date.parse(timeString);
   return Number.isNaN(ms) ? 0 : ms;
+}
+
+async function getChallengeRefundByRefundNo(outRefundNo) {
+  if (!outRefundNo) return null;
+  try {
+    const res = await db
+      .collection(REFUNDS_COLLECTION)
+      .where({ outRefundNo })
+      .limit(1)
+      .get();
+    return res.data && res.data.length ? res.data[0] : null;
+  } catch (err) {
+    console.warn("[getChallengeRefundByRefundNo] Query failed:", err.message);
+    return null;
+  }
 }
 
 async function getAfterServiceByRefundNo(outRefundNo) {
@@ -236,6 +252,65 @@ exports.main = async (event, context) => {
   }
 
   try {
+    const now = Date.now();
+
+    // ==========================================
+    // 支路一：优先查询 Challenge 免单退款 (refunds 集合)
+    // ==========================================
+    const challengeRefund = await getChallengeRefundByRefundNo(outRefundNo);
+    if (challengeRefund && challengeRefund.sourceType === "CHALLENGE_FREE_ORDER") {
+      console.log("[refundCallback] Matched CHALLENGE_FREE_ORDER refund:", {
+        refundId: challengeRefund._id,
+        orderId: challengeRefund.orderId,
+        outRefundNo,
+        finalStatus,
+      });
+
+      // 1. 更新 refunds 集合
+      await db.collection(REFUNDS_COLLECTION).doc(challengeRefund._id).update({
+        data: {
+          status: finalStatus === RefundStatus.SUCCESS ? "SUCCESS" : "FAILED",
+          wechatRefundId: refundId || challengeRefund.wechatRefundId,
+          updatedAt: now,
+        },
+      });
+
+      // 2. 更新订单状态机与履约暂扣状态
+      if (finalStatus === RefundStatus.SUCCESS) {
+        // 退款成功：释放暂扣，允许推送 ERP 进行备货/正常处理
+        await db.collection(ORDER_COLLECTION).doc(challengeRefund.orderId).update({
+          data: {
+            challengeRefundStatus: "SUCCESS",
+            fulfillmentHold: "NONE", // 解锁履约
+            erpStatus: "READY",      // 允许推送 ERP
+            challengeRefundInfo: {
+              refundId: challengeRefund._id,
+              outRefundNo,
+              wechatRefundId: refundId,
+              successTime: parseRefundTime(successTime) || now,
+            },
+            updatedAt: now,
+          },
+        });
+      } else {
+        // 退款失败或异常：继续锁定发货，标记退款失败待人工介入
+        await db.collection(ORDER_COLLECTION).doc(challengeRefund.orderId).update({
+          data: {
+            challengeRefundStatus: "FAILED",
+            fulfillmentHold: "REFUND_PENDING", // 坚决锁定
+            erpStatus: "HOLD",                 // 锁定 ERP
+            challengeRefundError: refundStatus || normalizedEventType || "REFUND_FAILED",
+            updatedAt: now,
+          },
+        });
+      }
+
+      return { errcode: 0, errmsg: "SUCCESS" };
+    }
+
+    // ==========================================
+    // 支路二：普通售后退款 (after-service 集合)
+    // ==========================================
     let service = await getAfterServiceByRefundNo(outRefundNo);
     if (!service && outTradeNo) {
       service = await getAfterServiceByOrderId(outTradeNo);
@@ -246,7 +321,7 @@ exports.main = async (event, context) => {
         outRefundNo,
         outTradeNo,
       });
-      return { errcode: 1, errmsg: "AFTER_SERVICE_NOT_FOUND" };
+      return { errcode: 1, errmsg: "RECORD_NOT_FOUND" };
     }
 
     console.log("[refundCallback] service matched:", {
@@ -265,7 +340,6 @@ exports.main = async (event, context) => {
       return { errcode: 0, errmsg: "SUCCESS" };
     }
 
-    const now = Date.now();
     const refundAmountCents = Number(amount && amount.refund);
     const refundAmount = Number.isFinite(refundAmountCents)
       ? Math.round(refundAmountCents) / 100

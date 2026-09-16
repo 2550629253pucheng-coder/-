@@ -161,6 +161,22 @@
   user-select: none;
 }
 
+.challenge-trigger-btn.ready-state {
+  background: radial-gradient(circle, #10b981 0%, #047857 100%);
+  box-shadow: 0 12rpx 36rpx rgba(16, 185, 129, 0.4);
+}
+
+.challenge-trigger-btn.stop-state {
+  background: radial-gradient(circle, #ef4444 0%, #dc2626 100%);
+  box-shadow: 0 12rpx 40rpx rgba(239, 68, 68, 0.6);
+  animation: stopButtonPulse 0.8s infinite alternate ease-in-out;
+}
+
+@keyframes stopButtonPulse {
+  0% { transform: scale(1); }
+  100% { transform: scale(1.06); }
+}
+
 .challenge-trigger-btn.pressed {
   transform: scale(0.92);
   background: radial-gradient(circle, #dc2626 0%, #b91c1c 100%);
