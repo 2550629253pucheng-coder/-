@@ -1,0 +1,135 @@
+<view class="challenge-container">
+  <!-- 顶部活动规则提示 -->
+  <view class="challenge-header">
+    <view class="badge">{{activityMode === 'TEST' ? '测试演练模式' : '真技巧 · 零套路'}}</view>
+    <view class="title">{{targetTime}} 秒极速挑战免单</view>
+    <view class="subtitle">长按圆盘并在心里默数，正好在 {{targetTime}} 秒松手！误差 ≤ {{toleranceMs}}ms 即可全额免单</view>
+  </view>
+
+  <!-- 倒计时/计时仪表盘核心 -->
+  <view class="timer-card">
+    <view class="timer-target-tag">目标时间：{{targetTime}} 秒 (容差 ±{{toleranceMs}}ms)</view>
+    <view class="timer-number {{status === 'PRESSING' ? 'active' : ''}}">
+      {{displayTime}}
+      <text class="unit">s</text>
+    </view>
+    
+    <!-- 状态文字指示 -->
+    <view class="status-tip">
+      <block wx:if="{{status === 'READY'}}">
+        <text>按住下方圆盘开始计时，精准 {{targetTime}} 秒时松手</text>
+      </block>
+      <block wx:elif="{{status === 'PRESSING'}}">
+        <text class="recording">正在计时中... 凭感觉松开！</text>
+      </block>
+      <block wx:elif="{{status === 'SUBMITTING'}}">
+        <text>正在提交服务端毫秒级判定...</text>
+      </block>
+      <block wx:elif="{{status === 'INTERRUPTED'}}">
+        <text class="lose-text">⚠️ 遭遇网络或系统异常中断，挑战资格已保留</text>
+      </block>
+      <block wx:elif="{{status === 'COMPLETED'}}">
+        <block wx:if="{{isPendingReview}}">
+          <text class="lose-text">🔍 成绩检测到微小时钟漂移，已转入风控复核队列，订单安全暂扣中</text>
+        </block>
+        <block wx:elif="{{isWinner}}">
+          <text class="win-text">🎉 恭喜挑战成功！已为您触发全额免单退款</text>
+        </block>
+        <block wx:else>
+          <text class="lose-text">距离 {{targetTime}} 秒偏差 {{result.diffMs}}ms，商品已为您安排正常履约发货</text>
+        </block>
+      </block>
+    </view>
+  </view>
+
+  <!-- 核心互动控制圆盘 -->
+  <view class="control-area">
+    <!-- 就绪或按压状态 -->
+    <block wx:if="{{status === 'READY' || status === 'PRESSING'}}">
+      <view class="pulse-ring {{status === 'PRESSING' ? 'animating' : ''}}">
+        <view
+          class="challenge-trigger-btn {{status === 'PRESSING' ? 'pressed' : ''}}"
+          bindtouchstart="onTouchStart"
+          bindtouchend="onTouchEnd"
+        >
+          <view class="inner-circle">
+            <view class="btn-title">{{status === 'PRESSING' ? '松手！' : '按住开始'}}</view>
+            <view class="btn-desc">{{status === 'PRESSING' ? '放开定格' : '心里默数'}}</view>
+          </view>
+        </view>
+      </view>
+    </block>
+
+    <!-- 中断异常可恢复状态 -->
+    <block wx:elif="{{status === 'INTERRUPTED'}}">
+      <view class="result-board" style="border-color: #f59e0b;">
+        <view class="result-icon-badge">
+          <text>⏱️</text>
+        </view>
+        <view class="result-title" style="color: #b45309;">挑战意外中断</view>
+        <view class="result-detail-text" style="margin-top: 12rpx;">
+          检测到网络异常或程序后台切换。系统绝不会草率将您判定为失败，您的挑战资格已安全锁存。
+        </view>
+        <view class="action-buttons" style="margin-top: 24rpx;">
+          <button class="primary-btn" bindtap="onResumeSession">恢复挑战继续</button>
+          <button class="secondary-btn" bindtap="onSkipChallenge">放弃并直接发货</button>
+        </view>
+      </view>
+    </block>
+
+    <!-- 挑战结算结果展示板 -->
+    <block wx:elif="{{status === 'COMPLETED'}}">
+      <view class="result-board {{isPendingReview ? '' : (isWinner ? 'winner' : 'loser')}}">
+        <view class="result-icon-badge">
+          <text wx:if="{{isPendingReview}}">🛡️</text>
+          <text wx:elif="{{isWinner}}">🏆</text>
+          <text wx:else>📦</text>
+        </view>
+        <view class="result-title">
+          {{isPendingReview ? '风控复核中' : (isWinner ? '免单达成！' : '挑战遗憾失利')}}
+        </view>
+        
+        <view class="result-stat-row">
+          <view class="stat-item">
+            <view class="stat-label">您的成绩</view>
+            <view class="stat-val">{{displayTime}}s</view>
+          </view>
+          <view class="stat-item">
+            <view class="stat-label">目标时间</view>
+            <view class="stat-val">{{targetTime}}s</view>
+          </view>
+          <view class="stat-item">
+            <view class="stat-label">毫秒偏差</view>
+            <view class="stat-val">{{result.diffMs || 0}}ms</view>
+          </view>
+        </view>
+
+        <view class="result-detail-text">
+          <text wx:if="{{isPendingReview}}">
+            系统检测到计时与网络链路存在可疑偏差，已自动为您挂起复核。在此期间订单发货已被安全拦截，待人工核实通过后自动补退款。
+          </text>
+          <text wx:elif="{{isWinner}}">
+            原路退款已通过独立退款通道触发。退款金额 ¥{{result.refundInfo.amountYuan || '0.00'}}。日用商品照常为您发货，敬请查收！
+          </text>
+          <text wx:else>
+            日用爆品真材实料，虽然未命中极窄容差，但订单已即刻解除发货锁定，仓配中心正在打包！
+          </text>
+        </view>
+
+        <view class="action-buttons">
+          <button class="primary-btn" bindtap="onViewOrder">查看订单履约</button>
+          <button class="secondary-btn" bindtap="onGoHome">返回商城逛逛</button>
+        </view>
+      </view>
+    </block>
+  </view>
+
+  <!-- 底部说明与跳过入口 -->
+  <view class="footer-bar" wx:if="{{status === 'READY'}}">
+    <view class="skip-btn" bindtap="onSkipChallenge">放弃挑战，直接发货</view>
+    <view class="legal-note">注：每笔订单限挑战 1 次；由服务端多源高精时钟校验，杜绝作弊。</view>
+  </view>
+
+  <t-toast id="t-toast" />
+  <t-dialog id="t-dialog" />
+</view>

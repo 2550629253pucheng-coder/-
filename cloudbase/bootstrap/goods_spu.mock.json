@@ -1,0 +1,138 @@
+[
+  {
+    "_id": "spu-tissue-01",
+    "spuId": "SPU-TISSUE-01",
+    "title": "原生木浆加厚抽纸 4层柔韧亲肤",
+    "primaryImage": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=600&auto=format&fit=crop&q=80",
+    "images": [
+      "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=800&auto=format&fit=crop&q=80",
+      "https://images.unsplash.com/photo-1607344645866-009c320c5ab8?w=800&auto=format&fit=crop&q=80"
+    ],
+    "desc": [
+      "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=800&auto=format&fit=crop&q=80"
+    ],
+    "minSalePrice": 1990,
+    "maxLinePrice": 2990,
+    "soldNum": 3520,
+    "spuStockQuantity": 1200,
+    "isPutOnSale": true,
+    "tags": [
+      "3秒免单",
+      "原生木浆",
+      "加厚4层"
+    ],
+    "categoryId": {
+      "_id": "cat-c2-tissue"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spu-garbage-02",
+    "spuId": "SPU-GARBAGE-02",
+    "title": "加厚手提式点断垃圾袋 承重防刺穿",
+    "primaryImage": "https://images.unsplash.com/photo-1610557892470-55d9e80c0bce?w=600&auto=format&fit=crop&q=80",
+    "images": [
+      "https://images.unsplash.com/photo-1610557892470-55d9e80c0bce?w=800&auto=format&fit=crop&q=80"
+    ],
+    "desc": [
+      "https://images.unsplash.com/photo-1610557892470-55d9e80c0bce?w=800&auto=format&fit=crop&q=80"
+    ],
+    "minSalePrice": 1290,
+    "maxLinePrice": 1990,
+    "soldNum": 2180,
+    "spuStockQuantity": 1500,
+    "isPutOnSale": true,
+    "tags": [
+      "3秒免单",
+      "自动收口",
+      "加厚韧性"
+    ],
+    "categoryId": {
+      "_id": "cat-c2-bags"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spu-wipes-03",
+    "spuId": "SPU-WIPES-03",
+    "title": "EDI纯水加厚柔湿巾 婴儿级无添加",
+    "primaryImage": "https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=600&auto=format&fit=crop&q=80",
+    "images": [
+      "https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=800&auto=format&fit=crop&q=80"
+    ],
+    "desc": [
+      "https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=800&auto=format&fit=crop&q=80"
+    ],
+    "minSalePrice": 1690,
+    "maxLinePrice": 2590,
+    "soldNum": 1840,
+    "spuStockQuantity": 900,
+    "isPutOnSale": true,
+    "tags": [
+      "3秒免单",
+      "EDI纯水",
+      "弱酸性配方"
+    ],
+    "categoryId": {
+      "_id": "cat-c2-wipes"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spu-laundry-04",
+    "spuId": "SPU-LAUNDRY-04",
+    "title": "深层洁净抑菌洗衣液 植萃持久留香",
+    "primaryImage": "https://images.unsplash.com/photo-1585421514738-01798e348b17?w=600&auto=format&fit=crop&q=80",
+    "images": [
+      "https://images.unsplash.com/photo-1585421514738-01798e348b17?w=800&auto=format&fit=crop&q=80"
+    ],
+    "desc": [
+      "https://images.unsplash.com/photo-1585421514738-01798e348b17?w=800&auto=format&fit=crop&q=80"
+    ],
+    "minSalePrice": 2990,
+    "maxLinePrice": 4990,
+    "soldNum": 4120,
+    "spuStockQuantity": 800,
+    "isPutOnSale": true,
+    "tags": [
+      "3秒免单",
+      "99%除菌",
+      "温和低泡"
+    ],
+    "categoryId": {
+      "_id": "cat-c2-laundry"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spu-kitchen-05",
+    "spuId": "SPU-KITCHEN-05",
+    "title": "吸油锁水加厚厨房纸巾 强效去油污",
+    "primaryImage": "https://images.unsplash.com/photo-1607344645866-009c320c5ab8?w=600&auto=format&fit=crop&q=80",
+    "images": [
+      "https://images.unsplash.com/photo-1607344645866-009c320c5ab8?w=800&auto=format&fit=crop&q=80"
+    ],
+    "desc": [
+      "https://images.unsplash.com/photo-1607344645866-009c320c5ab8?w=800&auto=format&fit=crop&q=80"
+    ],
+    "minSalePrice": 1590,
+    "maxLinePrice": 2290,
+    "soldNum": 1690,
+    "spuStockQuantity": 1000,
+    "isPutOnSale": true,
+    "tags": [
+      "3秒免单",
+      "食品级接触",
+      "吸油不掉屑"
+    ],
+    "categoryId": {
+      "_id": "cat-c2-kitchen"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  }
+]

@@ -1,0 +1,58 @@
+[
+  {
+    "_id": "comment-tissue-1",
+    "spuId": "spu-tissue-01",
+    "skuId": "SKU-TISSUE-8",
+    "specs": "8包轻享装",
+    "commentContent": "纸质非常柔韧厚实，沾水不破，包装完好发货神速！",
+    "commentScore": 5,
+    "userName": "居家好物家",
+    "userHeadUrl": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80",
+    "commentResources": [],
+    "isAnonymity": false,
+    "isAutoComment": false,
+    "sellerReply": "感谢您的支持，原生木浆品质保证！",
+    "goods": {
+      "title": "原生木浆加厚抽纸 4层柔韧亲肤",
+      "thumb": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=600&auto=format&fit=crop&q=80",
+      "specInfo": [
+        {
+          "specId": "SPEC-TISSUE",
+          "specValueId": "VAL-TISSUE-8",
+          "specTitle": "包装规格",
+          "specValue": "8包轻享装"
+        }
+      ]
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "comment-garbage-1",
+    "spuId": "spu-garbage-02",
+    "skuId": "SKU-GARBAGE-5",
+    "specs": "5卷(共100只)",
+    "commentContent": "手提自动收口非常方便，拉力很强不漏汤水，无限次回购。",
+    "commentScore": 5,
+    "userName": "生活管家小李",
+    "userHeadUrl": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=100&auto=format&fit=crop&q=80",
+    "commentResources": [],
+    "isAnonymity": false,
+    "isAutoComment": false,
+    "sellerReply": "感谢您的认可，加厚承重更安心！",
+    "goods": {
+      "title": "加厚手提式点断垃圾袋 承重防刺穿",
+      "thumb": "https://images.unsplash.com/photo-1610557892470-55d9e80c0bce?w=600&auto=format&fit=crop&q=80",
+      "specInfo": [
+        {
+          "specId": "SPEC-GARBAGE",
+          "specValueId": "VAL-GARBAGE-5",
+          "specTitle": "规格数量",
+          "specValue": "5卷(共100只)"
+        }
+      ]
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  }
+]

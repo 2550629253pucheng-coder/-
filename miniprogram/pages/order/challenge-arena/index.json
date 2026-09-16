@@ -1,0 +1,12 @@
+{
+  "navigationBarTitleText": "3秒挑战免单",
+  "navigationBarBackgroundColor": "#064e3b",
+  "navigationBarTextStyle": "white",
+  "backgroundColor": "#064e3b",
+  "usingComponents": {
+    "t-toast": "tdesign-miniprogram/toast/index",
+    "t-dialog": "tdesign-miniprogram/dialog/index",
+    "t-button": "tdesign-miniprogram/button/index",
+    "t-icon": "tdesign-miniprogram/icon/index"
+  }
+}

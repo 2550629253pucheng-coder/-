@@ -1,0 +1,77 @@
+{
+  "name": "retail-miniprogram-core",
+  "version": "1.0.1",
+  "type": "commonjs",
+  "description": "CloudBase-based retail mini program core for multi-tenant customization",
+  "main": "app.js",
+  "keywords": [
+    "wechat-miniprogram",
+    "cloudbase",
+    "tcb",
+    "tdesign",
+    "ecommerce",
+    "multi-tenant"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/menlong999/mini-ecom-open.git"
+  },
+  "bugs": {
+    "url": "https://github.com/menlong999/mini-ecom-open/issues"
+  },
+  "homepage": "https://github.com/menlong999/mini-ecom-open#readme",
+  "engines": {
+    "node": ">=18",
+    "npm": ">=9"
+  },
+  "scripts": {
+    "test": "npm run check",
+    "lint": "npm run lint:check",
+    "lint:check": "eslint --cache --ext .js .",
+    "lint:fix": "eslint --cache --fix --ext .js .",
+    "format:check": "node scripts/run-prettier.js --check",
+    "format:write": "node scripts/run-prettier.js --write",
+    "sync:tenant": "node scripts/sync-tenant-static.js",
+    "tenant:validate": "node scripts/validate-tenant-config.js",
+    "tenant:check": "npm run tenant:validate -- default && npm run tenant:validate -- example",
+    "tenant-boundary:check": "node scripts/check-tenant-boundary.js",
+    "cloudfunctions:check": "node scripts/check-cloudfunctions.js",
+    "service-boundary:check": "node scripts/check-service-boundary.js",
+    "style:check": "node scripts/check-style-boundary.js",
+    "check": "npm run tenant:check && npm run tenant-boundary:check && npm run cloudfunctions:check && npm run service-boundary:check && npm run style:check && npm run lint:check && npm run format:check",
+    "prepare": "node scripts/husky-install.js",
+    "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s"
+  },
+  "author": "menlong999 (https://github.com/menlong999)",
+  "license": "MIT",
+  "config": {
+    "commitizen": {
+      "path": "./node_modules/cz-conventional-changelog"
+    }
+  },
+  "lint-staged": {
+    "*.{js,ts}": "eslint --cache --fix",
+    "*.{js,ts,html,json,css,less}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "dayjs": "^1.9.3",
+    "tdesign-miniprogram": "^1.12.1",
+    "tslib": "^1.11.1"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^17.4.2",
+    "@commitlint/config-conventional": "^17.4.2",
+    "commitizen": "^4.3.0",
+    "conventional-changelog-cli": "^2.2.2",
+    "cz-conventional-changelog": "^3.3.0",
+    "eslint": "^6.8.0",
+    "eslint-config-prettier": "^6.10.0",
+    "eslint-plugin-import": "^2.20.1",
+    "eslint-plugin-prettier": "^3.1.2",
+    "husky": "^8.0.3",
+    "lint-staged": "^10.0.8",
+    "prettier": "^2.1.2"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "挑战免单商城",
+  "description": "基于微信原生小程序与CloudBase的挑战免单日用品电商系统",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

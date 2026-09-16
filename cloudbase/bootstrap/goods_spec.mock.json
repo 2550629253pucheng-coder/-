@@ -1,0 +1,107 @@
+[
+  {
+    "_id": "spec-tissue",
+    "specId": "SPEC-TISSUE",
+    "title": "包装规格",
+    "values": [
+      {
+        "valueId": "VAL-TISSUE-8",
+        "value": "8包轻享装"
+      },
+      {
+        "valueId": "VAL-TISSUE-24",
+        "value": "24包整箱实惠装"
+      }
+    ],
+    "sortOrder": 1,
+    "spuId": {
+      "_id": "spu-tissue-01"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spec-garbage",
+    "specId": "SPEC-GARBAGE",
+    "title": "规格数量",
+    "values": [
+      {
+        "valueId": "VAL-GARBAGE-5",
+        "value": "5卷(共100只)"
+      },
+      {
+        "valueId": "VAL-GARBAGE-10",
+        "value": "10卷(共200只加大装)"
+      }
+    ],
+    "sortOrder": 1,
+    "spuId": {
+      "_id": "spu-garbage-02"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spec-wipes",
+    "specId": "SPEC-WIPES",
+    "title": "规格",
+    "values": [
+      {
+        "valueId": "VAL-WIPES-3",
+        "value": "80抽*3包"
+      },
+      {
+        "valueId": "VAL-WIPES-6",
+        "value": "80抽*6包带盖家庭装"
+      }
+    ],
+    "sortOrder": 1,
+    "spuId": {
+      "_id": "spu-wipes-03"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spec-laundry",
+    "specId": "SPEC-LAUNDRY",
+    "title": "容量选择",
+    "values": [
+      {
+        "valueId": "VAL-LAUNDRY-2KG",
+        "value": "2kg日常瓶装"
+      },
+      {
+        "valueId": "VAL-LAUNDRY-5KG",
+        "value": "5kg大容量量贩装"
+      }
+    ],
+    "sortOrder": 1,
+    "spuId": {
+      "_id": "spu-laundry-04"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "spec-kitchen",
+    "specId": "SPEC-KITCHEN",
+    "title": "规格",
+    "values": [
+      {
+        "valueId": "VAL-KITCHEN-4",
+        "value": "4卷尝鲜装"
+      },
+      {
+        "valueId": "VAL-KITCHEN-12",
+        "value": "12卷整箱囤货装"
+      }
+    ],
+    "sortOrder": 1,
+    "spuId": {
+      "_id": "spu-kitchen-05"
+    },
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  }
+]

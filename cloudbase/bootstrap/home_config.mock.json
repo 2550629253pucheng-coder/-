@@ -1,0 +1,46 @@
+[
+  {
+    "searchPlaceholder": "搜索抽纸、垃圾袋、柔湿巾、洗衣液",
+    "swiper": [
+      {
+        "image": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=800&auto=format&fit=crop&q=80",
+        "spuId": "spu-tissue-01",
+        "linkType": "spu",
+        "poi": null
+      },
+      {
+        "image": "https://images.unsplash.com/photo-1585421514738-01798e348b17?w=800&auto=format&fit=crop&q=80",
+        "spuId": "spu-laundry-04",
+        "linkType": "spu",
+        "poi": null
+      }
+    ],
+    "tabList": [
+      {
+        "text": "3秒免单爆款",
+        "spuIds": [
+          "spu-tissue-01",
+          "spu-garbage-02",
+          "spu-laundry-04"
+        ]
+      },
+      {
+        "text": "纸品清洁",
+        "spuIds": [
+          "spu-tissue-01",
+          "spu-wipes-03",
+          "spu-kitchen-05"
+        ]
+      },
+      {
+        "text": "日化洗护",
+        "spuIds": [
+          "spu-garbage-02",
+          "spu-laundry-04"
+        ]
+      }
+    ],
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  }
+]

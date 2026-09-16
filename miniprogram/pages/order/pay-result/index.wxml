@@ -1,0 +1,63 @@
+<t-navbar background="#ffffff" left-icon="slot" />
+<view class="pay-result">
+  <view class="pay-result-card">
+    <view class="pay-status-icon">
+      <t-icon name="check" size="56rpx" color="#4F7D5A" />
+    </view>
+    <view class="pay-status-text">支付成功</view>
+    <view class="pay-status-desc">订单已提交，商家会尽快处理</view>
+  </view>
+
+  <view class="pay-summary">
+    <view class="pay-summary-label">微信支付</view>
+    <view class="pay-summary-amount">
+      <price
+        wx:if="{{totalPaid}}"
+        price="{{totalPaid}}"
+        wr-class="pay-money__price"
+        decimalSmaller
+        fill
+        priceUnit="yuan"
+      />
+      <text wx:else>¥0.00</text>
+    </view>
+  </view>
+
+  <!-- 3秒挑战免单专区卡片 -->
+  <view class="challenge-promo-card">
+    <view class="challenge-badge">专属特权 · 机会仅 1 次</view>
+    <view class="challenge-title">🎉 获得 3 秒挑战全额免单资格</view>
+    <view class="challenge-desc">按住圆盘并在精准 3.00 秒松手，误差 ≤ 10ms 立即全额退款免单！无论结果如何，日用品照常为您发货！</view>
+    <t-button
+      block
+      theme="primary"
+      t-class="challenge-action-btn"
+      size="large"
+      data-type="challenge"
+      bind:tap="onTapReturn"
+    >
+      立即开启 3 秒免单挑战
+    </t-button>
+  </view>
+
+  <view class="btn-wrapper">
+    <t-button
+      block
+      theme="primary"
+      t-class="status-btn status-btn-primary"
+      size="large"
+      data-type="orderList"
+      bind:tap="onTapReturn"
+      >查看订单</t-button
+    >
+    <t-button
+      block
+      theme="light"
+      t-class="status-btn status-btn-secondary"
+      size="large"
+      data-type="home"
+      bind:tap="onTapReturn"
+      >返回首页</t-button
+    >
+  </view>
+</view>

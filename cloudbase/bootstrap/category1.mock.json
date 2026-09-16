@@ -1,0 +1,18 @@
+[
+  {
+    "_id": "cat-c1-paper",
+    "category1Id": "C1-PAPER-CLEAN",
+    "category1Name": "纸品清洁",
+    "thumbnail": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=120&auto=format&fit=crop&q=80",
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  },
+  {
+    "_id": "cat-c1-homecare",
+    "category1Id": "C1-HOME-CARE",
+    "category1Name": "居家日化",
+    "thumbnail": "https://images.unsplash.com/photo-1585421514738-01798e348b17?w=120&auto=format&fit=crop&q=80",
+    "createdAt": 1726444800000,
+    "updatedAt": 1726444800000
+  }
+]
